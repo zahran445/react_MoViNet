@@ -61,6 +61,9 @@ desktop.ini
 .env
 .env.local
 
+# Database
+sawn.db
+
 # Temporary files
 *.tmp
 *.temp

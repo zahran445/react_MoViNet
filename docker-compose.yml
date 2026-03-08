@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  react-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sawn-react-dashboard
+    ports:
+      - "5000:5000"
+    volumes:
+      # Persist outputs (clips, snapshots, uploads, DB)
+      - ./outputs:/app/outputs
+      - ./models:/app/models
+    environment:
+      # Flask runs as plain Python script; these are here if you later switch to flask run
+      - FLASK_ENV=production
+    restart: unless-stopped
+
+    # For GPU acceleration (optional):
+    # Uncomment the section below and make sure you have:
+    # - Docker Desktop with WSL2 + NVIDIA GPU support
+    # - The nvidia-container-toolkit installed
+    #
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - capabilities: ["gpu"]
+    #           driver: nvidia
+    #           count: 1
+
