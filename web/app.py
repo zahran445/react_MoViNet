@@ -33,6 +33,8 @@ db = SQLAlchemy(app)
 Path(app.config["UPLOAD_FOLDER"]).mkdir(parents=True, exist_ok=True)
 Path(app.config["UPLOAD_VIDEO_FOLDER"]).mkdir(parents=True, exist_ok=True)
 
+processing_jobs = {} # Global job tracker
+
 # ── Database Models ────────────────────────────────────────────────────────
 
 class ViolationRecord(db.Model):
@@ -129,6 +131,12 @@ BASE_HTML = """
         .detail-card { background: rgba(255,255,255,0.03); border-radius: 12px; padding: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
         .detail-item label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; display: block; }
         .detail-item span { font-weight: 600; font-size: 15px; }
+
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+        .pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+        .active-job-card { background: rgba(16, 185, 129, 0.05); border: 1px dashed var(--accent); border-radius: 12px; padding: 16px; display: flex; align-items: center; gap: 16px; margin-bottom: 24px; }
+        .spinner { width: 20px; height: 20px; border: 2px solid rgba(16, 185, 129, 0.3); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
@@ -225,7 +233,14 @@ BASE_HTML = """
 
 HOME_HTML = BASE_HTML.replace("{% block content %}{% endblock %}", """
 <div class="stats-row" id="s-row"></div>
+
+<div id="active-jobs-container"></div>
+
 <div class="table-container">
+    <div style="padding: 20px 24px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center;">
+        <h3 style="font-size: 16px; font-weight: 600;">Detection Log</h3>
+        <span id="log-count" style="font-size: 12px; color: var(--text-dim);"></span>
+    </div>
     <table>
         <thead><tr><th>Timestamp</th><th>Reg No.</th><th>Conf.</th><th>Status</th><th>Play</th><th>Review</th></tr></thead>
         <tbody id="rows"></tbody>
@@ -234,13 +249,29 @@ HOME_HTML = BASE_HTML.replace("{% block content %}{% endblock %}", """
 <script>
     async function up(){
         const s = await (await fetch('/api/stats')).json();
+        const jobs = await (await fetch('/api/processing_status')).json();
+        
         document.getElementById('s-row').innerHTML = `
             <div class="stat-card"><div class="stat-label">Total</div><div class="stat-value">${s.total}</div></div>
             <div class="stat-card" style="color:var(--accent)"><div class="stat-label">Accepted</div><div class="stat-value">${s.accepted}</div></div>
             <div class="stat-card" style="color:var(--red)"><div class="stat-label">Rejected</div><div class="stat-value">${s.rejected}</div></div>
             <div class="stat-card"><div class="stat-label">Avg Conf.</div><div class="stat-value">${s.avg_confidence}%</div></div>
         `;
+
+        const activeJobsHtml = jobs.jobs.map(j => `
+            <div class="active-job-card pulse">
+                <div class="spinner"></div>
+                <div style="flex:1">
+                    <div style="font-size: 14px; font-weight: 600; color: var(--accent);">Active Analysis</div>
+                    <div style="font-size: 12px; color: var(--text-dim);">${j}</div>
+                </div>
+                <div style="font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;">AI Processing...</div>
+            </div>
+        `).join('');
+        document.getElementById('active-jobs-container').innerHTML = activeJobsHtml;
+
         const vs = await (await fetch('/api/violations?limit=50')).json();
+        document.getElementById('log-count').textContent = `${vs.length} entries`;
         document.getElementById('rows').innerHTML = vs.map(v => `
             <tr>
                 <td>${v.timestamp}</td>
@@ -252,7 +283,7 @@ HOME_HTML = BASE_HTML.replace("{% block content %}{% endblock %}", """
             </tr>
         `).join('') || '<tr><td colspan="6" style="text-align:center; padding:50px">No detections</td></tr>';
     }
-    up(); setInterval(up, 5000);
+    up(); setInterval(up, 3000);
 </script>
 """)
 
@@ -283,11 +314,94 @@ def upload():
                             video_path=v.video_path, plate_text=v.plate_text, status="PENDING"
                         )
                         db.session.add(rec); db.session.commit()
-                except: traceback.print_exc()
-                finally: processing_jobs.pop(fn, None)
+                except Exception as e:
+                    print(f"Background processing error: {e}")
+                    traceback.print_exc()
+                finally:
+                    processing_jobs.pop(fn, None)
         threading.Thread(target=task).start()
         return jsonify({"ok":True})
-    return render_template_string(BASE_HTML.replace("{% block content %}{% endblock %}", "<h2>Upload Video</h2><form id='f' style='margin-top:20px'><input type='file' id='i'><button class='btn btn-accent' type='submit' style='margin-top:20px'>Upload</button></form><script>document.getElementById('f').onsubmit=async e=>{e.preventDefault(); const fd=new FormData(); fd.append('video', document.getElementById('i').files[0]); await fetch('/upload',{method:'POST',body:fd}); location.href='/';}</script>"), title="Upload")
+    return render_template_string(BASE_HTML.replace("{% block content %}{% endblock %}", """
+    <div style="max-width: 600px; margin: 0 auto;">
+        <div style="background: var(--card-bg); border: 1px solid var(--border); border-radius: 24px; padding: 40px; text-align: center;">
+            <div style="width: 64px; height: 64px; background: rgba(16, 185, 129, 0.1); border-radius: 20px; display: flex; align-items: center; justify-content: center; margin: 0 auto 24px;">
+                <span style="font-size: 32px;">🎥</span>
+            </div>
+            <h2 style="font-size: 24px; margin-bottom: 8px;">Upload Evidence</h2>
+            <p style="color: var(--text-dim); font-size: 14px; margin-bottom: 32px;">Select a video file (MP4/AVI) for AI processing and violation analysis.</p>
+            
+            <form id="f">
+                <div style="border: 2px dashed var(--border); border-radius: 16px; padding: 40px 20px; margin-bottom: 32px; cursor: pointer; transition: all 0.3s;" 
+                     onclick="document.getElementById('i').click()" 
+                     onmouseover="this.style.borderColor=var(--accent); this.style.background='rgba(16,185,129,0.02)'" 
+                     onmouseout="this.style.borderColor=var(--border); this.style.background='transparent'">
+                    <input type="file" id="i" style="display:none" accept="video/*" onchange="updateFn(this)">
+                    <div id="file-info">
+                        <div style="font-size: 15px; font-weight: 600; margin-bottom: 4px;">Click to browse files</div>
+                        <div style="font-size: 12px; color: var(--text-dim);">Max file size: 50MB</div>
+                    </div>
+                </div>
+                
+                <button class="btn btn-accent" id="s-btn" type="submit" style="width: 100%; justify-content: center; height: 50px; font-size: 16px;" disabled>
+                    <span>Upload & Start Analysis</span>
+                </button>
+            </form>
+            
+            <div id="status-msg" style="margin-top: 24px; font-size: 14px; display: none;" class="pulse">
+                <span style="color: var(--accent); font-weight: 600;">⚡ Analysis in progress...</span>
+                <p style="color: var(--text-dim); font-size: 12px; margin-top: 4px;">You will be redirected shortly.</p>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        function updateFn(el){
+            const btn = document.getElementById('s-btn');
+            const info = document.getElementById('file-info');
+            if(el.files && el.files[0]){
+                info.innerHTML = `
+                    <div style="color: var(--accent); font-weight: 600; font-size: 15px;">${el.files[0].name}</div>
+                    <div style="font-size: 12px; color: var(--text-dim);">${(el.files[0].size/1024/1024).toFixed(2)} MB</div>
+                `;
+                btn.disabled = false;
+            } else {
+                info.innerHTML = `<div style="font-size: 15px; font-weight: 600;">Click to browse files</div><div style="font-size: 12px; color: var(--text-dim);">Max file size: 50MB</div>`;
+                btn.disabled = true;
+            }
+        }
+        
+        document.getElementById('f').onsubmit = async e => {
+            e.preventDefault();
+            const btn = document.getElementById('s-btn');
+            const msg = document.getElementById('status-msg');
+            const fileInput = document.getElementById('i');
+            
+            if(!fileInput.files[0]) return;
+            
+            btn.disabled = true;
+            btn.innerHTML = '<div class="spinner"></div><span style="margin-left:12px">Uploading Evidence...</span>';
+            msg.style.display = 'block';
+            
+            const fd = new FormData();
+            fd.append('video', fileInput.files[0]);
+            
+            try {
+                const res = await fetch('/upload', {method: 'POST', body: fd});
+                if(res.ok) {
+                    btn.innerHTML = '✔ Uploaded Successfully';
+                    setTimeout(() => { location.href = '/'; }, 1000);
+                } else {
+                    throw new Error('Upload failed');
+                }
+            } catch(err) {
+                btn.innerHTML = '❌ Upload Failed';
+                btn.classList.remove('btn-accent');
+                btn.classList.add('btn-red');
+                setTimeout(() => { location.reload(); }, 2000);
+            }
+        };
+    </script>
+    """), title="Upload")
 
 @app.route("/api/processing_status")
 def api_status(): return jsonify({"jobs": list(processing_jobs.keys())})
