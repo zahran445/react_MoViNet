@@ -1,0 +1,24 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.git
+.gitignore
+.cursor/
+.vscode/
+.idea/
+
+# Local datasets and large artifacts
+New_SawnDataset/
+outputs/
+debug_video.py
+*.mp4
+*.avi
+
+# OS / editor junk
+*.log
+*.DS_Store
+Thumbs.db
+

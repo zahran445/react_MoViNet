@@ -137,7 +137,7 @@ class SAWNDetector:
         except:
             return 0
 
-    def process_video(self, video_path: str) -> Optional[Violation]:
+    def process_video(self, video_path: str, progress_callback=None) -> Optional[Violation]:
         print(f"[SAWN] Scanning video (Streaming Mode): {Path(video_path).name}")
         cap = cv2.VideoCapture(video_path)
         fps = int(cap.get(cv2.CAP_PROP_FPS) or 30)
@@ -172,13 +172,29 @@ class SAWNDetector:
                     max_conf = conf
                     best_label = label
                     peak_frame_idx = frame_idx - 8
+
+            # Update progress callback if provided
+            if progress_callback and total_frames > 0 and frame_idx % max(step, 5) == 0:
+                pct = min(100, int((frame_idx / total_frames) * 100))
+                try:
+                    progress_callback(pct)
+                except Exception:
+                    # Callback issues should not break processing
+                    pass
             
             frame_idx += 1
             if frame_idx % 100 == 0:
-                print(f"  → Scanned {frame_idx}/{total_frames} frames...")
+                print(f"  -> Scanned {frame_idx}/{total_frames} frames...")
         
         cap.release()
-        print(f"  → Scan complete in {time.time() - start_time:.1f}s")
+        print(f"  -> Scan complete in {time.time() - start_time:.1f}s")
+
+        # Ensure we report completion if callback is provided
+        if progress_callback:
+            try:
+                progress_callback(100)
+            except Exception:
+                pass
         
         if max_conf < self.THRESHOLD:
             print(f"  [SKIP] No violation found (Max Conf: {max_conf:.1%})")
@@ -230,6 +246,71 @@ class SAWNDetector:
         )
         self._save_assets(v)
         return v
+
+    def run_live(self, source: int = 0, show_preview: bool = True, callback: Optional[callable] = None) -> List[Violation]:
+        print(f"[SAWN] Starting Live Feed (Source: {source})")
+        cap = cv2.VideoCapture(source)
+        if not cap.isOpened():
+            print(f"  [ERROR] Could not open video source {source}")
+            return []
+
+        window = []
+        violations = []
+        last_violation_time = 0
+        cooldown = 5 # seconds
+
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret: break
+
+                window.append(frame)
+                if len(window) > 16:
+                    window.pop(0)
+
+                if len(window) == 16:
+                    label, conf = self.classifier.predict_segment(window)
+                    
+                    if conf > self.THRESHOLD and (time.time() - last_violation_time) > cooldown:
+                        print(f"  [LIVE DETECTED] {label} ({conf:.1%})")
+                        vtype = "Pedestrian" if "Pedestrian" in label else "Vehicle"
+                        
+                        self._counter += 1
+                        snapshot = frame.copy()
+                        
+                        plate_crop, plate_text = None, ""
+                        if vtype == "Vehicle":
+                            res = self.plate_det.detect(snapshot)
+                            if res: plate_crop, plate_text = res
+                        
+                        v = Violation(
+                            id             = self._counter,
+                            timestamp      = datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            violation_type = vtype,
+                            confidence     = conf,
+                            snapshot       = snapshot,
+                            face_crop      = self.face_det.detect(snapshot),
+                            plate_crop     = plate_crop,
+                            plate_text     = plate_text
+                        )
+                        self._save_assets(v)
+                        violations.append(v)
+                        if callback:
+                            callback(v)
+                        last_violation_time = time.time()
+
+                if show_preview:
+                    cv2.imshow("SAWN Live Dashboard", frame)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+        except KeyboardInterrupt:
+            pass
+        finally:
+            cap.release()
+            cv2.destroyAllWindows()
+        
+        return violations
+
 
     def _save_clip_segment(self, frames: List[np.ndarray], fps: int, dst_path: str):
         if not frames: return

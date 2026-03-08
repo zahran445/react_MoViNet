@@ -229,6 +229,54 @@ Open **http://localhost:5000**
 
 ---
 
+## Docker Deployment
+
+You can run the full REACT/SAWN dashboard inside Docker (no local Python/venv needed).
+
+### 1. Build the image
+
+```bash
+docker build -t sawn-react .
+```
+
+### 2. Run the container (simple)
+
+```bash
+docker run --rm -p 5000:5000 sawn-react
+```
+
+Then open `http://localhost:5000` in your browser.
+
+### 3. Using docker-compose (recommended, with persistent volumes)
+
+```bash
+docker compose up --build
+```
+
+This:
+
+- Builds the image from `Dockerfile`.
+- Maps port `5000` on your machine to the Flask app in the container.
+- Mounts `./outputs` and `./models` so:
+  - New violation clips/snapshots and `sawn.db` are kept on your host.
+  - Your trained models in `models/` are visible to the container.
+
+### 4. GPU acceleration (optional)
+
+The default image is **CPU-only** for portability. For GPU use:
+
+- Enable NVIDIA GPU support for Docker (Docker Desktop + WSL2 + `nvidia-container-toolkit`).
+- Replace the base image in `Dockerfile` with an NVIDIA / PyTorch image, for example:
+
+```Dockerfile
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+```
+
+- Uncomment the `deploy.resources.reservations.devices` section in `docker-compose.yml` to request a GPU.
+
+All other usage inside the container remains the same (uploads, dashboard, etc.).
+
+
 ## Performance Targets (from paper)
 
 | Metric | Paper Result | Notes |
