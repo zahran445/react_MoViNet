@@ -65,11 +65,14 @@ def run(args):
 
     # ── Webcam ────────────────────────────────────────────────────────────────
     if source.isdigit():
-        violations = det.run_live(int(source), show_preview=not args.no_preview)
-        if args.log_to_web:
-            for v in violations:
+        def on_detect(v):
+            if args.log_to_web:
                 log_to_web(v, args.web_url)
+        
+        # We modify detector.py to accept a callback for real-time logging
+        violations = det.run_live(int(source), show_preview=not args.no_preview, callback=on_detect)
         return
+
 
     src_path = Path(source)
 

@@ -15,13 +15,13 @@ env/
 ENV/
 .venv
 
-# Models (large files)
-*.pt
-*.pth
-*.ckpt
-*.h5
-*.pkl
-*.pb
+# Models (large files) - now handled by Git LFS
+# *.pt
+# *.pth
+# *.ckpt
+# *.h5
+# *.pkl
+# *.pb
 
 # Datasets
 New_SawnDataset/

@@ -134,9 +134,16 @@ BASE_HTML = """
 
         @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
         .pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
-        .active-job-card { background: rgba(16, 185, 129, 0.05); border: 1px dashed var(--accent); border-radius: 12px; padding: 16px; display: flex; align-items: center; gap: 16px; margin-bottom: 24px; }
-        .spinner { width: 20px; height: 20px; border: 2px solid rgba(16, 185, 129, 0.3); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+        .active-job-card { background: rgba(16, 185, 129, 0.05); border: 1px solid var(--border); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 12px; margin-bottom: 24px; }
+        .job-info { display: flex; align-items: center; justify-content: space-between; width: 100%; }
+        .spinner { width: 14px; height: 14px; border: 2px solid rgba(16, 185, 129, 0.3); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
+        
+        /* Dashed Progress Bar */
+        .progress-container { height: 6px; background: rgba(255,255,255,0.05); border-radius: 3px; overflow: hidden; position: relative; }
+        .progress-bar { height: 100%; width: 100%; background: linear-gradient(90deg, transparent, var(--accent), transparent); background-size: 200% 100%; animation: moveGradient 2s linear infinite; position: relative; }
+        .progress-bar::after { content: ''; position: absolute; inset: 0; background-image: linear-gradient(90deg, var(--card-bg) 2px, transparent 2px); background-size: 8px 100%; }
+        @keyframes moveGradient { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
     </style>
 </head>
 <body>
@@ -258,16 +265,27 @@ HOME_HTML = BASE_HTML.replace("{% block content %}{% endblock %}", """
             <div class="stat-card"><div class="stat-label">Avg Conf.</div><div class="stat-value">${s.avg_confidence}%</div></div>
         `;
 
-        const activeJobsHtml = jobs.jobs.map(j => `
-            <div class="active-job-card pulse">
-                <div class="spinner"></div>
-                <div style="flex:1">
-                    <div style="font-size: 14px; font-weight: 600; color: var(--accent);">Active Analysis</div>
-                    <div style="font-size: 12px; color: var(--text-dim);">${j}</div>
+        const activeJobsHtml = jobs.jobs.map(j => {
+            const elapsed = Math.floor(Date.now()/1000 - j.start_time);
+            const m = Math.floor(elapsed/60).toString().padStart(2, '0');
+            const s = (elapsed%60).toString().padStart(2, '0');
+            const pct = j.progress || 0;
+            return `
+                <div class="active-job-card">
+                    <div class="job-info">
+                        <div style="display:flex; align-items:center; gap:10px">
+                            <div class="spinner"></div>
+                            <div style="font-size: 14px; font-weight: 600; color: var(--accent);">AI Processing (${pct}%)</div>
+                            <div style="font-size: 12px; color: var(--text-dim); max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${j.filename}</div>
+                        </div>
+                        <div style="font-size: 13px; font-family: monospace; color: var(--accent); font-weight:700">${m}:${s}s elapsed</div>
+                    </div>
+                    <div class="progress-container">
+                        <div class="progress-bar" style="width: ${pct}%; background: var(--accent); animation: none"></div>
+                    </div>
                 </div>
-                <div style="font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;">AI Processing...</div>
-            </div>
-        `).join('');
+            `;
+        }).join('');
         document.getElementById('active-jobs-container').innerHTML = activeJobsHtml;
 
         const vs = await (await fetch('/api/violations?limit=50')).json();
@@ -298,13 +316,18 @@ def upload():
         fn = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{file.filename}"
         p = Path(app.config["UPLOAD_VIDEO_FOLDER"]) / fn
         file.save(str(p))
-        processing_jobs[fn] = "Processing"
+        processing_jobs[fn] = {"start_time": datetime.now().timestamp(), "status": "Processing", "progress": 0}
         def task():
             with app.app_context():
                 try:
                     from utils.detector import SAWNDetector
                     det = SAWNDetector(str(BASE_DIR/"models"/"movinet"/"movinet_best.pt"), str(BASE_DIR/"models"/"yolov8"/"plates_yolov8"/"weights"/"best.pt"))
-                    v = det.process_video(str(p))
+                    
+                    def progress_cb(pct):
+                        if fn in processing_jobs:
+                            processing_jobs[fn]["progress"] = pct
+                            
+                    v = det.process_video(str(p), progress_callback=progress_cb)
                     if v:
                         rec = ViolationRecord(
                             timestamp=v.timestamp, violation_type=v.violation_type, confidence=float(v.confidence),
@@ -404,7 +427,11 @@ def upload():
     """), title="Upload")
 
 @app.route("/api/processing_status")
-def api_status(): return jsonify({"jobs": list(processing_jobs.keys())})
+def api_status():
+    return jsonify({"jobs": [
+        {"filename": k, "start_time": v["start_time"], "progress": v.get("progress", 0)} 
+        for k, v in processing_jobs.items()
+    ]})
 
 @app.route("/api/violations")
 def api_vs():

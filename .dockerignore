@@ -12,10 +12,29 @@ __pycache__/
 
 # Local datasets and large artifacts
 New_SawnDataset/
+New_SawnDataset-main/
+New_SawnDataset*/
 outputs/
+models/
+sawn.db
 debug_video.py
 *.mp4
 *.avi
+*.mkv
+*.mov
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.keras
+*.h5
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.png
+*.jpg
+*.jpeg
 
 # OS / editor junk
 *.log
