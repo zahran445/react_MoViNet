@@ -76,7 +76,7 @@ class MoViNetClassifier:
 # ── Plate & Face Detectors ───────────────────────────────────────────────────
 
 class PlateDetector:
-    def __init__(self, model_path: str, conf: float = 0.5):
+    def __init__(self, model_path: str, conf: float = 0.05):
         self.model = None
         self.conf  = conf
         self.reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available(), verbose=False)
@@ -84,23 +84,81 @@ class PlateDetector:
             try:
                 from ultralytics import YOLO
                 self.model = YOLO(model_path)
-                print(f"[YOLOv8] Plate detector loaded")
+                print(f"[YOLOv8] Plate detector loaded (conf threshold: {conf})")
             except Exception as e:
                 print(f"[YOLOv8] Warning: {e}")
 
     def detect(self, frame) -> Optional[tuple[np.ndarray, str]]:
-        if not self.model: return None
-        for r in self.model.predict(frame, conf=self.conf, verbose=False):
-            for box in r.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                plate_crop = frame[y1:y2, x1:x2].copy()
-                try:
-                    ocr_res = self.reader.readtext(plate_crop)
-                    plate_text = "".join([text[1] for text in ocr_res if text[2] > 0.3]).upper()
-                    plate_text = "".join(filter(str.isalnum, plate_text))
-                    return plate_crop, plate_text
-                except:
-                    return plate_crop, ""
+        """
+        Detects the strongest plate, expands the crop slightly, and applies
+        OCR with rotation robustness for portrait-oriented snapshots.
+        """
+        if not self.model:
+            return None
+
+        # Try original, then rotation (common in portrait snapshots)
+        orientations = [
+            ("Original", frame),
+            ("Rotated CW", cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)),
+            ("Rotated CCW", cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE))
+        ]
+
+        best_crop = None
+        best_text = ""
+        best_conf = 0.0
+
+        for name, img in orientations:
+            h, w = img.shape[:2]
+            results = self.model.predict(img, conf=self.conf, verbose=False)
+            for r in results:
+                for box in r.boxes:
+                    score = float(box.conf[0]) if hasattr(box, "conf") else 0.0
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+                    # Expand box by 15% in each direction to avoid cutting characters
+                    pad_x = int((x2 - x1) * 0.15)
+                    pad_y = int((y2 - y1) * 0.15)
+                    ex1 = max(0, x1 - pad_x)
+                    ey1 = max(0, y1 - pad_y)
+                    ex2 = min(w, x2 + pad_x)
+                    ey2 = min(h, y2 + pad_y)
+
+                    crop = img[ey1:ey2, ex1:ex2].copy()
+                    if crop.size == 0:
+                        continue
+
+                    try:
+                        # Upscale small crops a bit for better OCR
+                        ch, cw = crop.shape[:2]
+                        if max(ch, cw) < 120:
+                            scale = 120.0 / max(ch, cw)
+                            crop = cv2.resize(
+                                crop,
+                                (int(cw * scale), int(ch * scale)),
+                                interpolation=cv2.INTER_CUBIC,
+                            )
+
+                        ocr_res = self.reader.readtext(crop)
+                        # Keep characters with lower confidence floor (some fonts are tricky)
+                        chars = [t[1] for t in ocr_res if t[2] >= 0.1]
+                        text = "".join(chars).upper()
+                        # Filter to alphanumeric only
+                        text = "".join(filter(str.isalnum, text))
+                        
+                        # If empty after filtering, try raw OCR text as fallback
+                        if not text and ocr_res:
+                            text = "".join([t[1] for t in ocr_res]).strip().upper()
+
+                        # Prefer boxes with non‑empty OCR; break ties by YOLO score
+                        if text and (score >= best_conf or not best_text):
+                            best_conf = score
+                            best_text = text
+                            best_crop = crop
+                    except Exception:
+                        continue
+
+        if best_crop is not None:
+            return best_crop, best_text
         return None
 
 class FaceDetector:
@@ -224,9 +282,15 @@ class SAWNDetector:
         # OCR / Face
         plate_crop, plate_text = None, ""
         if vtype == "Vehicle":
-            res = self.plate_det.detect(snapshot)
+            # Try multiple frames to find the best plate view
+            res = self._find_best_plate(clip_frames, fps, peak_frame_idx - start_f)
             if res:
                 plate_crop, plate_text = res
+            else:
+                # Fallback: try the single snapshot
+                res = self.plate_det.detect(snapshot)
+                if res:
+                    plate_crop, plate_text = res
 
         # Save Clip
         clip_name = f"violation_{self._counter:04d}_clip.mp4"
@@ -311,20 +375,71 @@ class SAWNDetector:
         
         return violations
 
+    def _find_best_plate(self, clip_frames: List[np.ndarray], fps: int, peak_idx: int) -> Optional[tuple[np.ndarray, str]]:
+        """
+        Sample multiple frames from the clip to find the best plate detection.
+        Tries frames around the peak to find clearest plate view.
+        """
+        if not clip_frames:
+            return None
+        
+        # Sample frames: peak frame and nearby frames (0.5s before/after)
+        sample_indices = []
+        half_sec_frames = max(1, fps // 2)
+        
+        # Add peak frame first
+        if 0 <= peak_idx < len(clip_frames):
+            sample_indices.append(peak_idx)
+        
+        # Add frames before and after peak
+        for offset in range(1, half_sec_frames + 1):
+            before_idx = peak_idx - offset
+            after_idx = peak_idx + offset
+            if 0 <= before_idx < len(clip_frames):
+                sample_indices.append(before_idx)
+            if 0 <= after_idx < len(clip_frames):
+                sample_indices.append(after_idx)
+        
+        best_result = None
+        best_score = 0.0
+        
+        for idx in sample_indices:
+            if idx < 0 or idx >= len(clip_frames):
+                continue
+            
+            frame = clip_frames[idx]
+            result = self.plate_det.detect(frame)
+            
+            if result:
+                crop, text = result
+                # Score based on text length and non-empty text
+                if text:
+                    # Longer text generally means better OCR detection
+                    score = len(text)
+                    if score > best_score:
+                        best_score = score
+                        best_result = result
+        
+        return best_result
 
     def _save_clip_segment(self, frames: List[np.ndarray], fps: int, dst_path: str):
         if not frames: return
         h, w = frames[0].shape[:2]
-        target_h = 480
-        target_w = int(target_h * (w / h))
-        
+        # Preserve original resolution for higher clarity
+        target_w, target_h = w, h
+
         fourcc = cv2.VideoWriter_fourcc(*'avc1')
         out = cv2.VideoWriter(dst_path, fourcc, fps, (target_w, target_h))
         if not out.isOpened():
-            out = cv2.VideoWriter(dst_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (target_w, target_h))
-            
+            out = cv2.VideoWriter(
+                dst_path,
+                cv2.VideoWriter_fourcc(*'mp4v'),
+                fps,
+                (target_w, target_h),
+            )
+
         for f in frames:
-            out.write(cv2.resize(f, (target_w, target_h)))
+            out.write(f)
         out.release()
 
     def _save_assets(self, v: Violation):
