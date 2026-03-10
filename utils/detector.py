@@ -149,13 +149,10 @@ class SAWNDetector:
             return None
 
         # --- Temporal Scan Phase (Memory Efficient) ---
-        max_conf = 0.0
-        best_label = ""
-        peak_frame_idx = 0
-        
         step = max(1, fps // 2)
         window = []
         frame_idx = 0
+        eval_history = []  # (frame_idx, peak_frame, label, conf)
         
         start_time = time.time()
         while True:
@@ -168,10 +165,7 @@ class SAWNDetector:
             
             if len(window) == 16 and frame_idx % step == 0:
                 label, conf = self.classifier.predict_segment(window)
-                if conf > max_conf:
-                    max_conf = conf
-                    best_label = label
-                    peak_frame_idx = frame_idx - 8
+                eval_history.append((frame_idx, frame_idx - 8, label, conf))
 
             # Update progress callback if provided
             if progress_callback and total_frames > 0 and frame_idx % max(step, 5) == 0:
@@ -195,6 +189,24 @@ class SAWNDetector:
                 progress_callback(100)
             except Exception:
                 pass
+
+        if not eval_history:
+            print(f"  [SKIP] No evaluations performed")
+            return None
+
+        # Find peak: use raw max, but guard against false early spikes
+        best_idx = max(range(len(eval_history)), key=lambda i: eval_history[i][3])
+
+        # If peak is at the very first evaluation, check for false spike:
+        # a false spike has a large drop (>15%) to the next evaluation
+        if best_idx == 0 and len(eval_history) > 2:
+            first_conf = eval_history[0][3]
+            next_conf = eval_history[1][3]
+            if (first_conf - next_conf) > 0.15:
+                # False early spike — pick the best from remaining evaluations
+                best_idx = max(range(1, len(eval_history)), key=lambda i: eval_history[i][3])
+
+        _, peak_frame_idx, best_label, max_conf = eval_history[best_idx]
         
         if max_conf < self.THRESHOLD:
             print(f"  [SKIP] No violation found (Max Conf: {max_conf:.1%})")
