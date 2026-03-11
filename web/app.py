@@ -106,7 +106,7 @@ BASE_HTML = """
         .btn-red { background: var(--red); color: #fff; }
 
         .content { padding: 40px; max-width: 1400px; }
-        .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; margin-bottom: 40px; }
+        .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 24px; margin-bottom: 40px; }
         .stat-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 16px; padding: 24px; }
         .stat-label { color: var(--text-dim); font-size: 14px; margin-bottom: 12px; }
         .stat-value { font-size: 32px; font-weight: 700; }
@@ -121,16 +121,46 @@ BASE_HTML = """
         .status-rejected { background: rgba(239, 68, 68, 0.1); color: var(--red); border: 1px solid var(--red); }
         .status-pending { background: rgba(245, 158, 11, 0.1); color: var(--yellow); border: 1px solid var(--yellow); }
 
-        .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 1000; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
+        .modal-overlay { display: none; position: fixed; inset: 0; padding: 24px; background: rgba(0,0,0,0.85); z-index: 1000; align-items: center; justify-content: center; backdrop-filter: blur(4px); overflow-y: auto; }
         .modal-overlay.open { display: flex; }
-        .modal { background: var(--card-bg); border: 1px solid var(--border); border-radius: 24px; padding: 32px; width: 800px; max-width: 95vw; box-shadow: 0 20px 50px rgba(0,0,0,0.5); }
-        .video-player { width: 100%; border-radius: 12px; border: 1px solid var(--border); margin-bottom: 24px; background: #000; overflow: hidden; height: 350px; }
-        .asset-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 24px; }
-        .asset-box { background: #000; border-radius: 12px; height: 150px; overflow: hidden; border: 1px solid var(--border); }
-        .asset-box img { width: 100%; height: 100%; object-fit: cover; }
+        .modal { background: var(--card-bg); border: 1px solid var(--border); border-radius: 24px; padding: 32px; width: min(960px, 100%); max-width: 100%; max-height: calc(100vh - 48px); overflow-y: auto; box-shadow: 0 20px 50px rgba(0,0,0,0.5); }
+        .modal-header { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 24px; }
+        .modal-actions-row { display: flex; justify-content: flex-end; gap: 16px; margin-top: 32px; flex-wrap: wrap; }
+        .video-player { width: 100%; border-radius: 12px; border: 1px solid var(--border); margin-bottom: 24px; background: #000; overflow: hidden; aspect-ratio: 16 / 9; max-height: min(42vh, 350px); }
+        .asset-grid { display: flex; gap: 16px; margin-bottom: 24px; align-items: stretch; }
+        .asset-box { background: #000; border-radius: 12px; height: 220px; overflow: hidden; border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; color: var(--text-dim); min-width: 0; }
+        .asset-box img { width: 100%; height: 100%; object-fit: contain; background: #000; }
+        .asset-box-snap { flex: 0.9; }
+        .asset-box-plate { flex: 1.8; height: 220px; padding: 10px 16px; }
+        .asset-box-plate img { object-position: center; }
         .detail-card { background: rgba(255,255,255,0.03); border-radius: 12px; padding: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
         .detail-item label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; display: block; }
         .detail-item span { font-weight: 600; font-size: 15px; }
+
+        @media (max-width: 900px) {
+            .modal-overlay { padding: 16px; align-items: flex-start; }
+            .modal { padding: 24px; max-height: calc(100vh - 32px); }
+            .asset-grid { gap: 12px; }
+            .asset-box { height: 190px; }
+            .asset-box-plate { height: 190px; }
+        }
+
+        @media (max-width: 640px) {
+            .modal-overlay { padding: 8px; }
+            .modal { padding: 16px; border-radius: 16px; max-height: calc(100vh - 16px); }
+            .modal-header { flex-direction: column; align-items: stretch; }
+            .modal-header .btn { width: 100%; justify-content: center; }
+            .video-player { margin-bottom: 16px; max-height: min(34vh, 220px); }
+            .asset-grid { flex-direction: column; gap: 12px; }
+            .asset-box { height: 140px; }
+            .asset-box-snap { flex: none; }
+            .asset-box-plate { flex: none; height: 180px; padding: 8px; }
+            .detail-card { grid-template-columns: 1fr; gap: 12px; padding: 14px; }
+            .modal-actions-row { margin-top: 20px; }
+            .modal-actions-row .btn { width: 100%; justify-content: center; }
+            #modal-actions { width: 100%; display: flex; gap: 12px; flex-wrap: wrap; }
+            #modal-actions > * { flex: 1 1 100%; text-align: center; justify-content: center; }
+        }
 
         @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
         .pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
@@ -170,7 +200,7 @@ BASE_HTML = """
     <!-- UI Modal -->
     <div class="modal-overlay" id="detailModal">
         <div class="modal">
-            <div style="display:flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
+            <div class="modal-header">
                 <h3 id="modal-title" style="font-size:20px">Evidence</h3>
                 <button class="btn btn-outline" onclick="closeModal()">← Back to Log</button>
             </div>
@@ -178,14 +208,13 @@ BASE_HTML = """
             <div id="modal-v-container" class="video-player"></div>
             
             <div id="modal-assets" class="asset-grid">
-                <div class="asset-box" id="m-snap"></div>
-                <div class="asset-box" id="m-face"></div>
-                <div class="asset-box" id="m-plate"></div>
+                <div class="asset-box asset-box-snap" id="m-snap"></div>
+                <div class="asset-box asset-box-plate" id="m-plate"></div>
             </div>
 
             <div id="modal-details" class="detail-card"></div>
 
-            <div style="display:flex; justify-content: flex-end; gap:16px; margin-top:32px">
+            <div class="modal-actions-row">
                 <button class="btn btn-outline" onclick="closeModal()">Close</button>
                 <div id="modal-actions" style="display:flex; gap:12px"></div>
             </div>
@@ -207,10 +236,9 @@ BASE_HTML = """
             vWrap.innerHTML = d.video_url ? `<video controls autoplay loop muted width="100%" height="100%"><source src="${d.video_url}" type="video/mp4"></video>` : 'No Video';
 
             if(forReview){
-                assetWrap.style.display = 'grid';
+                assetWrap.style.display = 'flex';
                 detailWrap.style.display = 'grid';
                 document.getElementById('m-snap').innerHTML = d.snapshot_url ? `<img src="${d.snapshot_url}">` : '';
-                document.getElementById('m-face').innerHTML = d.face_url ? `<img src="${d.face_url}">` : 'No Face';
                 document.getElementById('m-plate').innerHTML = d.plate_url ? `<img src="${d.plate_url}">` : 'No Plate';
                 detailWrap.innerHTML = `
                     <div class="detail-item"><label>Reg No.</label><span>${d.plate_text}</span></div>
@@ -246,10 +274,13 @@ HOME_HTML = BASE_HTML.replace("{% block content %}{% endblock %}", """
 <div class="table-container">
     <div style="padding: 20px 24px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center;">
         <h3 style="font-size: 16px; font-weight: 600;">Detection Log</h3>
-        <span id="log-count" style="font-size: 12px; color: var(--text-dim);"></span>
+        <div style="display:flex; align-items:center; gap:12px">
+            <span id="log-count" style="font-size: 12px; color: var(--text-dim);"></span>
+            <button class="btn btn-red" style="padding:6px 14px; font-size:12px" onclick="clearAllLogs()">🗑 Clear All</button>
+        </div>
     </div>
     <table>
-        <thead><tr><th>Timestamp</th><th>Reg No.</th><th>Conf.</th><th>Status</th><th>Play</th><th>Review</th></tr></thead>
+        <thead><tr><th>Timestamp</th><th>Reg No.</th><th>Conf.</th><th>Status</th><th>Play</th><th>Review</th><th>Delete</th></tr></thead>
         <tbody id="rows"></tbody>
     </table>
 </div>
@@ -263,6 +294,7 @@ HOME_HTML = BASE_HTML.replace("{% block content %}{% endblock %}", """
             <div class="stat-card" style="color:var(--accent)"><div class="stat-label">Accepted</div><div class="stat-value">${s.accepted}</div></div>
             <div class="stat-card" style="color:var(--red)"><div class="stat-label">Rejected</div><div class="stat-value">${s.rejected}</div></div>
             <div class="stat-card"><div class="stat-label">Avg Conf.</div><div class="stat-value">${s.avg_confidence}%</div></div>
+            <div class="stat-card"><div class="stat-label">Last Detection</div><div class="stat-value" style="font-size:14px; padding-top:6px">${s.last_detection || '—'}</div></div>
         `;
 
         const activeJobsHtml = jobs.jobs.map(j => {
@@ -298,8 +330,19 @@ HOME_HTML = BASE_HTML.replace("{% block content %}{% endblock %}", """
                 <td><span class="status-badge status-${v.status.toLowerCase()}">${v.status}</span></td>
                 <td><button class="btn btn-outline" style="padding:6px" onclick='openModal(${JSON.stringify(v)}, false)'>▶ Play</button></td>
                 <td><button class="btn btn-accent" style="padding:6px 12px; font-size:12px" onclick='openModal(${JSON.stringify(v)}, true)'>${v.status.toUpperCase()=='PENDING'?'Review':'View'}</button></td>
+                <td><button class="btn btn-red" style="padding:6px 10px; font-size:12px" onclick='deleteLog(${v.id})'>🗑</button></td>
             </tr>
-        `).join('') || '<tr><td colspan="6" style="text-align:center; padding:50px">No detections</td></tr>';
+        `).join('') || '<tr><td colspan="7" style="text-align:center; padding:50px">No detections</td></tr>';
+    }
+    async function deleteLog(id) {
+        if (!confirm('Delete this entry?')) return;
+        await fetch('/api/violations/' + id, {method: 'DELETE'});
+        up();
+    }
+    async function clearAllLogs() {
+        if (!confirm('Delete ALL detection log entries? This cannot be undone.')) return;
+        await fetch('/api/violations/all', {method: 'DELETE'});
+        up();
     }
     up(); setInterval(up, 3000);
 </script>
@@ -447,7 +490,9 @@ def api_stats():
     acc = ViolationRecord.query.filter_by(status="ACCEPTED").count()
     rej = ViolationRecord.query.filter_by(status="REJECTED").count()
     avg = db.session.query(func.avg(ViolationRecord.confidence)).scalar() or 0
-    return jsonify({"total":total, "accepted":acc, "rejected":rej, "avg_confidence":round(float(avg)*100,1)})
+    last = ViolationRecord.query.order_by(ViolationRecord.id.desc()).first()
+    last_ts = last.timestamp if last else None
+    return jsonify({"total":total, "accepted":acc, "rejected":rej, "avg_confidence":round(float(avg)*100,1), "last_detection":last_ts})
 
 @app.route("/api/accept_violation/<int:vid>", methods=["POST"])
 def api_acc(vid):
@@ -458,6 +503,19 @@ def api_acc(vid):
 def api_rej(vid):
     v = ViolationRecord.query.get_or_404(vid)
     v.status = "REJECTED"; db.session.commit(); return jsonify({"ok":True})
+
+@app.route("/api/violations/<int:vid>", methods=["DELETE"])
+def api_delete_violation(vid):
+    v = ViolationRecord.query.get_or_404(vid)
+    db.session.delete(v)
+    db.session.commit()
+    return jsonify({"ok": True})
+
+@app.route("/api/violations/all", methods=["DELETE"])
+def api_clear_all_violations():
+    ViolationRecord.query.delete()
+    db.session.commit()
+    return jsonify({"ok": True})
 
 @app.route("/assets/<path:fn>")
 def serve_asset(fn): return send_from_directory(app.config["UPLOAD_FOLDER"], fn)

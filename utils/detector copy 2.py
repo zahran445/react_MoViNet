@@ -82,7 +82,6 @@ class Violation:
     plate_crop: Optional[np.ndarray] = None
     plate_text: str = ""
     video_path: str = ""
-    plate_bbox: Optional[tuple[int, int, int, int]] = None  # (x1, y1, x2, y2) for visualization
 
 
 class MoViNetClassifier:
@@ -271,282 +270,79 @@ class PlateDetector:
         matrix = cv2.getPerspectiveTransform(rect, dst)
         return cv2.warpPerspective(image, matrix, (400, 120))
 
-    def _lower_plate_exposure(self, plate_img: np.ndarray) -> np.ndarray:
-        if plate_img is None or plate_img.size == 0:
-            return np.array([])
-
-        lab = cv2.cvtColor(plate_img, cv2.COLOR_BGR2LAB)
-        l_channel, a_channel, b_channel = cv2.split(lab)
-        l_channel = cv2.normalize(l_channel, None, 0, 255, cv2.NORM_MINMAX)
-        l_channel = cv2.convertScaleAbs(l_channel, alpha=1.18, beta=-24)
-        l_channel = np.minimum(l_channel, 232).astype(np.uint8)
-
-        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-        l_channel = clahe.apply(l_channel)
-        merged = cv2.merge((l_channel, a_channel, b_channel))
-        return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
-
     def _get_plate_corners(self, frame: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> np.ndarray:
-        # Add padding to bbox to give contour detection more context
-        h, w = frame.shape[:2]
-        pad_x = int((x2 - x1) * 0.1)
-        pad_y = int((y2 - y1) * 0.1)
-        x1_pad = max(0, x1 - pad_x)
-        y1_pad = max(0, y1 - pad_y)
-        x2_pad = min(w, x2 + pad_x)
-        y2_pad = min(h, y2 + pad_y)
-        
-        roi = frame[y1_pad:y2_pad, x1_pad:x2_pad]
+        roi = frame[y1:y2, x1:x2]
         if roi.size == 0:
             return np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype="float32")
 
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        # More aggressive edge detection for better plate boundary
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        edged = cv2.Canny(blur, 30, 150)
-        
-        # Dilate edges to connect broken contours
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        edged = cv2.dilate(edged, kernel, iterations=1)
-        
+        edged = cv2.Canny(blur, 50, 200)
         contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         contours = sorted(contours, key=cv2.contourArea, reverse=True)
 
-        roi_h, roi_w = roi.shape[:2]
-        min_area = (roi_w * roi_h) * 0.3  # At least 30% of ROI
-        
-        for cnt in contours[:10]:
-            area = cv2.contourArea(cnt)
-            if area < min_area:
-                continue
-                
+        for cnt in contours[:5]:
             peri = cv2.arcLength(cnt, True)
-            # Try different epsilon values for better approximation
-            for epsilon_factor in [0.02, 0.03, 0.015]:
-                approx = cv2.approxPolyDP(cnt, epsilon_factor * peri, True)
-                if len(approx) == 4:
-                    corners = approx.reshape(4, 2).astype("float32")
-                    corners[:, 0] += x1_pad
-                    corners[:, 1] += y1_pad
-                    
-                    # Validate corners form a reasonable quadrilateral
-                    rect = self._order_points(corners)
-                    width = np.linalg.norm(rect[1] - rect[0])
-                    height = np.linalg.norm(rect[3] - rect[0])
-                    aspect = width / max(1, height)
-                    
-                    if 1.5 <= aspect <= 8.0 and width >= 40 and height >= 15:
-                        return corners
+            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+            if len(approx) == 4:
+                corners = approx.reshape(4, 2).astype("float32")
+                corners[:, 0] += x1
+                corners[:, 1] += y1
+                return corners
 
-        # Fallback: return original bbox
         return np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype="float32")
 
-    def _preprocess_plate(self, plate_img: np.ndarray) -> tuple[list[np.ndarray], list[np.ndarray]]:
-        if plate_img is None or plate_img.size == 0:
-            return [], []
-            
-        # Upscale for better OCR (but not too much)
-        h, w = plate_img.shape[:2]
-        if h < 40 or w < 120:
-            # Small plate, upscale 3x
-            upscaled = cv2.resize(plate_img, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-        elif h < 80 or w < 240:
-            # Medium plate, upscale 2x
-            upscaled = cv2.resize(plate_img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-        else:
-            # Already large enough
-            upscaled = plate_img.copy()
-
-        lowered = self._lower_plate_exposure(upscaled)
-        gray = cv2.cvtColor(lowered, cv2.COLOR_BGR2GRAY)
-        denoised = cv2.GaussianBlur(gray, (3, 3), 0)
-        normalized = cv2.normalize(denoised, None, 0, 255, cv2.NORM_MINMAX)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(normalized)
-        enhanced = cv2.convertScaleAbs(enhanced, alpha=1.12, beta=-12)
-
-        blackhat_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        blackhat = cv2.morphologyEx(enhanced, cv2.MORPH_BLACKHAT, blackhat_kernel)
-        boosted = cv2.addWeighted(enhanced, 1.0, blackhat, 0.8, 0)
-
-        gauss = cv2.GaussianBlur(boosted, (0, 0), 1.1)
-        sharpened = cv2.addWeighted(boosted, 1.35, gauss, -0.35, 0)
-
-        _, binary_otsu = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        binary_adapt = cv2.adaptiveThreshold(
-            sharpened,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            27,
-            6,
-        )
-        _, binary_inv = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
+    def _preprocess_plate(self, plate_img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        upscaled = cv2.resize(plate_img, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(upscaled, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+        sharpened = cv2.filter2D(enhanced, -1, kernel)
+        _, binary = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         kernel2 = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-        cleaned_otsu = cv2.morphologyEx(binary_otsu, cv2.MORPH_CLOSE, kernel2)
-        cleaned_adapt = cv2.morphologyEx(binary_adapt, cv2.MORPH_CLOSE, kernel2)
-        cleaned_inv = cv2.morphologyEx(binary_inv, cv2.MORPH_OPEN, kernel2)
+        cleaned = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel2)
+        return cleaned, upscaled
 
-        color_variants = [lowered, cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)]
-        binary_variants = [cleaned_otsu, cleaned_adapt, cleaned_inv]
-        return binary_variants, color_variants
-
-    def _is_plausible_plate_candidate(self, text: str) -> bool:
-        cleaned = self._clean_text(text)
-        if len(cleaned) < 7 or len(cleaned) > 10:
-            return False
-        candidate, is_valid, _ = self._validate_indian_plate(cleaned)
-        if is_valid:
-            return True
-        return len(candidate) >= 2 and candidate[:2] in INDIAN_STATE_CODES
-
-    def _build_retry_plate_variants(self, plate_crop: np.ndarray) -> list[np.ndarray]:
-        if plate_crop is None or plate_crop.size == 0:
-            return []
-
-        lowered = self._lower_plate_exposure(plate_crop)
-        high_contrast = cv2.convertScaleAbs(lowered, alpha=1.38, beta=-26)
-        low_contrast = cv2.convertScaleAbs(lowered, alpha=0.92, beta=6)
-        darker_high_contrast = cv2.convertScaleAbs(plate_crop, alpha=1.55, beta=-44)
-        brighter_soft = cv2.convertScaleAbs(plate_crop, alpha=1.02, beta=16)
-
-        gamma_dark = np.clip(((plate_crop.astype(np.float32) / 255.0) ** 1.35) * 255.0, 0, 255).astype(np.uint8)
-        gray = cv2.cvtColor(lowered, cv2.COLOR_BGR2GRAY)
-        gray_eq = cv2.equalizeHist(gray)
-        gray_bgr = cv2.cvtColor(gray_eq, cv2.COLOR_GRAY2BGR)
-
-        return [
-            plate_crop,
-            lowered,
-            high_contrast,
-            low_contrast,
-            darker_high_contrast,
-            brighter_soft,
-            gamma_dark,
-            gray_bgr,
-        ]
-
-    def _retry_plate_text(self, plate_crop: np.ndarray) -> tuple[str, float]:
-        best_text = ""
-        best_conf = 0.0
-
-        for idx, variant_crop in enumerate(self._build_retry_plate_variants(plate_crop), start=1):
-            variant_text = self._read_plate_text(variant_crop)
-            variant_conf = float(self.last_read_conf)
-            print(f"      [OCR Retry] variant#{idx}: '{variant_text}' conf={variant_conf:.3f}")
-            if self._accept_plate_text(variant_text, variant_conf) and variant_conf > best_conf:
-                best_text = variant_text
-                best_conf = variant_conf
-
-        self.last_read_conf = best_conf
-        return best_text, best_conf
-
-    def _read_plate_text_paddle(self, color_variants: List[np.ndarray]) -> tuple[str, float, str]:
+    def _read_plate_text_paddle(self, color_img: np.ndarray) -> tuple[str, float, str]:
         if self.paddle is None:
             return "", 0.0, "PaddleOCR"
+        try:
+            result = self.paddle.ocr(color_img, cls=True)
+        except Exception:
+            return "", 0.0, "PaddleOCR"
+        if not result or not result[0]:
+            return "", 0.0, "PaddleOCR"
 
-        best_valid_text = ""
-        best_valid_conf = 0.0
-        best_plausible_text = ""
-        best_plausible_conf = 0.0
-
-        for color_img in color_variants:
-            if color_img is None or color_img.size == 0:
+        best_text = ""
+        best_conf = 0.0
+        for line in result[0]:
+            if len(line) < 2:
                 continue
-            try:
-                result = self.paddle.ocr(color_img, cls=True)
-            except Exception:
-                continue
-            if not result or not result[0]:
-                continue
+            text = str(line[1][0])
+            conf = float(line[1][1])
+            candidate, is_valid, _ = self._validate_indian_plate(text)
+            if is_valid and conf > best_conf:
+                best_text = candidate
+                best_conf = conf
+        return best_text, best_conf, "PaddleOCR"
 
-            for line in result[0]:
-                if len(line) < 2:
-                    continue
-                text = str(line[1][0])
-                conf = float(line[1][1])
-                candidate, is_valid, _ = self._validate_indian_plate(text)
-                if is_valid and conf > best_valid_conf:
-                    best_valid_text = candidate
-                    best_valid_conf = conf
-                elif self._is_plausible_plate_candidate(candidate) and conf > best_plausible_conf:
-                    best_plausible_text = candidate
-                    best_plausible_conf = conf
-
-        if best_valid_text:
-            return best_valid_text, best_valid_conf, "PaddleOCR"
-        return best_plausible_text, best_plausible_conf, "PaddleOCR"
-
-    def _enhance_plate_for_display(self, plate_crop: np.ndarray, detected_text: str = "") -> np.ndarray:
+    def _enhance_plate_for_display(self, plate_crop: np.ndarray) -> np.ndarray:
         if plate_crop is None or plate_crop.size == 0:
             return plate_crop
 
-        # ── Step 1: Upscale to a fixed display width ───────────────────────
-        target_w = 480
-        h0, w0 = plate_crop.shape[:2]
-        scale = max(4.0, target_w / max(1, w0))
-        upscaled = cv2.resize(plate_crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LANCZOS4)
-
-        # ── Step 2: Mild cleanup + contrast for readable display ───────────
-        lowered = self._lower_plate_exposure(upscaled)
-        denoised = cv2.GaussianBlur(lowered, (3, 3), 0)
+        display = cv2.resize(plate_crop, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LANCZOS4)
+        denoised = cv2.bilateralFilter(display, 7, 45, 45)
         gauss = cv2.GaussianBlur(denoised, (0, 0), 1.2)
-        sharp = cv2.addWeighted(denoised, 1.2, gauss, -0.2, 0)
+        return cv2.addWeighted(denoised, 1.5, gauss, -0.5, 0)
 
-        # ── Step 3: Contrast / brightness normalisation per channel ────────
-        result = np.zeros_like(sharp)
-        for c in range(sharp.shape[2] if len(sharp.shape) == 3 else 1):
-            ch = sharp[:, :, c] if len(sharp.shape) == 3 else sharp
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(6, 6))
-            eq = clahe.apply(ch)
-            eq = cv2.convertScaleAbs(eq, alpha=1.08, beta=-6)
-            if len(sharp.shape) == 3:
-                result[:, :, c] = eq
-            else:
-                result = eq
-        enhanced = result
-
-        # ── Step 4: Subtle final sharpening pass ───────────────────────────
-        kernel = np.array([[0, -0.25, 0], [-0.25, 2.0, -0.25], [0, -0.25, 0]], dtype=np.float32)
-        enhanced = cv2.filter2D(enhanced, -1, kernel)
-
-        # ── Step 5: Text label bar at the bottom ───────────────────────────
-        label = detected_text if detected_text else "NO PLATE"
-        h, w = enhanced.shape[:2]
-        bar_h = 44
-        canvas = np.zeros((h + bar_h, w, 3), dtype=np.uint8)
-        canvas[:h] = enhanced if len(enhanced.shape) == 3 else cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-        # dark bar
-        canvas[h:] = (30, 30, 30)
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 1.0
-        thickness = 2
-        (tw, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
-        tx = max(0, (w - tw) // 2)
-        ty = h + (bar_h + th) // 2 - 2
-        color = (80, 220, 80) if detected_text else (80, 80, 220)
-        cv2.putText(canvas, label, (tx + 1, ty + 1), font, font_scale, (0, 0, 0), thickness + 2)
-        cv2.putText(canvas, label, (tx, ty), font, font_scale, color, thickness)
-
-        return canvas
-
-    def _read_plate_text_easy(self, binary_variants: List[np.ndarray], color_variants: List[np.ndarray]) -> tuple[str, float, str]:
-        best_valid_text = ""
-        best_valid_conf = 0.0
-        best_plausible_text = ""
-        best_plausible_conf = 0.0
-        variants = [*color_variants, *binary_variants]
+    def _read_plate_text_easy(self, binary_img: np.ndarray, color_img: np.ndarray) -> tuple[str, float, str]:
+        best_text = ""
+        best_conf = 0.0
+        variants = [color_img, binary_img]
         for image in variants:
-            if image is None or image.size == 0:
-                continue
             try:
-                results = self.reader.readtext(
-                    image,
-                    detail=1,
-                    paragraph=False,
-                    allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-                )
+                results = self.reader.readtext(image)
             except Exception:
                 continue
             for _, text, conf in results:
@@ -555,48 +351,29 @@ class PlateDetector:
                 except (TypeError, ValueError):
                     conf_val = 0.0
                 candidate, is_valid, _ = self._validate_indian_plate(text)
-                if is_valid and conf_val > best_valid_conf:
-                    best_valid_text = candidate
-                    best_valid_conf = conf_val
-                elif self._is_plausible_plate_candidate(candidate) and conf_val > best_plausible_conf:
-                    best_plausible_text = candidate
-                    best_plausible_conf = conf_val
-
-        if best_valid_text:
-            return best_valid_text, best_valid_conf, "EasyOCR"
-        return best_plausible_text, best_plausible_conf, "EasyOCR"
+                if is_valid and conf_val > best_conf:
+                    best_text = candidate
+                    best_conf = conf_val
+        return best_text, best_conf, "EasyOCR"
 
     def _read_plate_text(self, plate_crop: np.ndarray) -> str:
-        binary_variants, color_variants = self._preprocess_plate(plate_crop)
+        binary_img, color_img = self._preprocess_plate(plate_crop)
         results: list[tuple[str, float, str]] = []
 
-        # Debug: Check if preprocessing produced valid images
-        if not color_variants:
-            print("[PlateDetector] Warning: color variants are empty after preprocessing")
-            self.last_read_conf = 0.0
-            return ""
-        if not binary_variants:
-            print("[PlateDetector] Warning: binary variants are empty after preprocessing")
-            self.last_read_conf = 0.0
-            return ""
-
-        paddle_result = self._read_plate_text_paddle(color_variants)
+        paddle_result = self._read_plate_text_paddle(color_img)
         if paddle_result[0]:
             results.append(paddle_result)
-            print(f"      [OCR] PaddleOCR: '{paddle_result[0]}' conf={paddle_result[1]:.3f}")
 
-        easy_result = self._read_plate_text_easy(binary_variants, color_variants)
+        easy_result = self._read_plate_text_easy(binary_img, color_img)
         if easy_result[0]:
             results.append(easy_result)
-            print(f"      [OCR] EasyOCR:   '{easy_result[0]}' conf={easy_result[1]:.3f}")
 
         if not results:
             self.last_read_conf = 0.0
             return ""
 
-        best_text, best_conf, engine = max(results, key=lambda item: item[1])
+        best_text, best_conf, _ = max(results, key=lambda item: item[1])
         self.last_read_conf = best_conf
-        print(f"      [OCR] Best ({engine}): '{best_text}' conf={best_conf:.3f}")
         return best_text
 
     def _accept_plate_text(self, text: str, conf: float) -> bool:
@@ -605,9 +382,9 @@ class PlateDetector:
         cleaned = self._clean_text(text)
         if not self._is_valid_plate_regex(cleaned):
             return False
-        return conf >= 0.20
+        return conf >= 0.32
 
-    def detect(self, frame: np.ndarray) -> Optional[tuple[np.ndarray, str, tuple[int, int, int, int]]]:
+    def detect(self, frame: np.ndarray) -> Optional[tuple[np.ndarray, str]]:
         if self.model is None:
             return None
 
@@ -628,7 +405,6 @@ class PlateDetector:
                 candidates.append((score, (x1, y1, x2, y2), conf_val))
 
         if not candidates:
-            # print("[PlateDetector] No plate candidates detected")
             return None
 
         candidates.sort(key=lambda item: item[0], reverse=True)
@@ -636,58 +412,29 @@ class PlateDetector:
         best_text = ""
         best_conf = 0.0
         best_score = -1e9
-        best_bbox = None
 
-        print(f"  [PlateDetector] {len(candidates)} candidate(s) found, evaluating top 3...")
         for det_score, (x1, y1, x2, y2), det_conf in candidates[:3]:
             corners = self._get_plate_corners(frame, x1, y1, x2, y2)
             warped = self._four_point_warp(frame, corners)
-
-            # Validate warped dimensions
             if warped is None or warped.size == 0:
                 continue
-            if warped.shape[0] < 20 or warped.shape[1] < 60:
-                continue
 
-            # Sharpness check — skip blurry crops before expensive OCR
-            gray_warp = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY) if len(warped.shape) == 3 else warped
-            sharpness = float(cv2.Laplacian(gray_warp, cv2.CV_64F).var())
-            if sharpness < 25.0:
-                print(f"    [PlateDetector] bbox=({x1},{y1},{x2},{y2}) sharpness={sharpness:.1f} -> TOO BLURRY, skipping OCR")
-                # Still record as a visual candidate so we have at least a crop
-                if best_crop is None:
-                    best_crop = self._enhance_plate_for_display(warped, "")
-                    best_bbox = (x1, y1, x2, y2)
-                continue
-
-            print(f"    [PlateDetector] bbox=({x1},{y1},{x2},{y2}) det_conf={det_conf:.2f} sharpness={sharpness:.1f} -> running OCR")
             plate_text = self._read_plate_text(warped)
             ocr_conf = float(self.last_read_conf)
-            if not self._accept_plate_text(plate_text, ocr_conf):
-                retry_text, retry_conf = self._retry_plate_text(warped)
-                if retry_text and retry_conf >= ocr_conf:
-                    plate_text = retry_text
-                    ocr_conf = retry_conf
-            print(f"    [PlateDetector] OCR result: '{plate_text}' conf={ocr_conf:.3f} valid={self._accept_plate_text(plate_text, ocr_conf)}")
             valid_bonus = 1.5 if self._accept_plate_text(plate_text, ocr_conf) else 0.0
             score = det_score + (ocr_conf * 4.0) + valid_bonus + det_conf
 
             if score > best_score:
                 best_score = score
-                # Return raw OCR text so _pick_plate_from_frames can accumulate votes.
-                # The final acceptance gate lives in the consensus logic, not here.
-                best_text = plate_text
-                best_crop = self._enhance_plate_for_display(warped, plate_text)
+                best_crop = self._enhance_plate_for_display(warped)
+                best_text = plate_text if self._accept_plate_text(plate_text, ocr_conf) else ""
                 best_conf = ocr_conf
-                best_bbox = (x1, y1, x2, y2)
 
         if best_crop is None:
-            print("  [PlateDetector] No usable crop produced")
             return None
 
         self.last_read_conf = best_conf
-        print(f"  [PlateDetector] Final plate: '{best_text}' conf={best_conf:.3f}")
-        return best_crop, best_text, best_bbox
+        return best_crop, best_text
 
 
 class FaceDetector:
@@ -750,7 +497,6 @@ class SAWNDetector:
 
     def _pick_plate_from_frames(self, frames: List[np.ndarray]) -> tuple[Optional[np.ndarray], str]:
         if not frames:
-            print("  [PlateOCR] No frames provided for plate search")
             return None, ""
 
         votes: dict[str, float] = {}
@@ -762,18 +508,18 @@ class SAWNDetector:
         best_visual_score = -1e9
         top_visual_crops: list[tuple[float, np.ndarray]] = []
 
-        # Scan every provided frame — caller is responsible for deciding sampling rate.
-        print(f"  [PlateOCR] Scanning all {len(frames)} plate frames for consensus...")
-        detected_count = 0
-        valid_text_count = 0
+        # Accuracy mode: sample more frames for stronger temporal consensus.
+        step = max(1, len(frames) // 20)
+        sampled = frames[::step]
+        if sampled[-1] is not frames[-1]:
+            sampled.append(frames[-1])
 
-        for frame_no, frame in enumerate(frames):
+        for frame in sampled:
             result = self.plate_det.detect(frame)
             if not result:
                 continue
-            detected_count += 1
 
-            plate_crop, plate_text, plate_bbox = result
+            plate_crop, plate_text = result
             visual_score = self.plate_det._plate_texture_score(plate_crop)
             if visual_score > best_visual_score:
                 best_visual_score = visual_score
@@ -787,12 +533,8 @@ class SAWNDetector:
                     top_visual_crops[min_idx] = (visual_score, plate_crop)
 
             if not self._is_plausible_plate_text(plate_text):
-                if plate_text:
-                    print(f"    [PlateOCR] Frame {frame_no}: implausible text '{plate_text}', skipping")
                 continue
 
-            valid_text_count += 1
-            print(f"    [PlateOCR] Frame {frame_no}: plausible plate '{plate_text}'")
             key = re.sub(r"[^A-Z0-9]", "", plate_text.upper())
             ocr_conf = float(getattr(self.plate_det, "last_read_conf", 0.0))
             vote_weight = 1.0 + (ocr_conf * 1.5) + max(0.0, min(1.5, visual_score * 0.25))
@@ -831,51 +573,24 @@ class SAWNDetector:
                 conf_sums = merged_conf
                 text_seen = merged_count
 
-        print(f"  [PlateOCR] Summary: {detected_count}/{len(frames)} frames had plate bbox, {valid_text_count} had plausible text")
-
         if not votes:
             if best_visual_crop is None:
-                print("  [PlateOCR] No plate found in any frame")
                 return None, ""
-            # Retry OCR on top visual candidates (sorted by sharpness) to recover text.
-            print("  [PlateOCR] No votes — retrying OCR on sharpest visual crops...")
-            for rank, (vscore, candidate_crop) in enumerate(sorted(top_visual_crops, key=lambda item: item[0], reverse=True)):
-                fallback_text, fallback_conf = self.plate_det._retry_plate_text(candidate_crop)
-                print(f"    [PlateOCR] Fallback crop #{rank+1} visual_score={vscore:.2f} -> '{fallback_text}'")
+            # Retry OCR on top visual candidates to recover hard frames.
+            for _, candidate_crop in sorted(top_visual_crops, key=lambda item: item[0], reverse=True):
+                fallback_text = self.plate_det._read_plate_text(candidate_crop)
                 if self._is_plausible_plate_text(fallback_text):
-                    print(f"  [PlateOCR] Recovered plate text from fallback: '{fallback_text}'")
-                    self.plate_det.last_read_conf = fallback_conf
                     return candidate_crop, fallback_text
-            print("  [PlateOCR] All fallbacks failed; returning best visual crop with no text")
             return best_visual_crop, ""
 
         best_text = max(votes, key=lambda key: (votes[key], conf_sums.get(key, 0.0) / max(1, text_seen.get(key, 1))))
         best_votes = votes[best_text]
         best_count = text_seen.get(best_text, 1)
         avg_conf = conf_sums.get(best_text, 0.0) / max(1, best_count)
-        # Accept if the plate is regex-valid and seen more than once, OR conf is high enough.
-        is_regex_valid = self.plate_det._is_valid_plate_regex(best_text)
-        rejected = False
-        if is_regex_valid:
-            # Valid format: require at least 2 detections across frames (outvotes noise)
-            if best_count < 2:
-                rejected = True
-        else:
-            # Unknown format: stricter — need good conf + votes
-            if avg_conf < 0.28 or best_votes < 1.5:
-                rejected = True
+        # Prevent single noisy frame OCR from being accepted as final text.
+        if (best_count < 2 and avg_conf < 0.45) or avg_conf < 0.22 or best_votes < 1.5:
+            return best_visual_crop, ""
 
-        if rejected:
-            print(f"  [PlateOCR] Consensus REJECTED: text='{best_text}' valid={is_regex_valid} count={best_count} avg_conf={avg_conf:.3f} votes={best_votes:.1f}")
-            retry_crop = crops.get(best_text)
-            retry_text, retry_conf = self.plate_det._retry_plate_text(retry_crop) if retry_crop is not None else ("", 0.0)
-            if self._is_plausible_plate_text(retry_text):
-                self.plate_det.last_read_conf = retry_conf
-                print(f"  [PlateOCR] Recovered plate text after consensus retry: '{retry_text}'")
-                return retry_crop, retry_text
-            return crops.get(best_text), ""
-
-        print(f"  [PlateOCR] Consensus ACCEPTED: text='{best_text}' valid={is_regex_valid} count={best_count} avg_conf={avg_conf:.3f} votes={best_votes:.1f}")
         return crops.get(best_text), best_text
 
     def process_video(self, video_path: str, progress_callback=None) -> Optional[Violation]:
@@ -956,8 +671,7 @@ class SAWNDetector:
         start_frame = max(0, peak_frame_idx - (fps * 3))
         clip_frames = []
         plate_scan_frames = []
-        # Sample every ~3–4 frames so more clear frames are available for OCR consensus.
-        sample_every = max(1, fps // 8)
+        sample_every = max(1, fps // 4)
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         for i in range(int(fps * 6)):
             try:
@@ -976,33 +690,18 @@ class SAWNDetector:
                 clip_for_save = clip_frame
             clip_frames.append(clip_for_save)
 
-            # Sample more densely so blurry frames are outvoted by sharp ones.
+            # For OCR, sample fewer frames and keep the original quality frame.
             if i % sample_every == 0:
                 plate_scan_frames.append(clip_frame)
         cap.release()
-        print(f"  [SAWN] Clip collected: {len(clip_frames)} frames, {len(plate_scan_frames)} sampled for plate scan")
 
         plate_crop, plate_text = self._pick_plate_from_frames(plate_scan_frames)
-        plate_bbox = None
         if plate_crop is None and snapshot is not None:
-            print("  [SAWN] No plate from clip; retrying on peak snapshot frame")
             result = self.plate_det.detect(snapshot)
             if result:
-                candidate_crop, candidate_text, candidate_bbox = result
+                candidate_crop, candidate_text = result
                 plate_crop = candidate_crop
-                if self._is_plausible_plate_text(candidate_text):
-                    plate_text = candidate_text
-                else:
-                    retry_text, retry_conf = self.plate_det._retry_plate_text(candidate_crop)
-                    plate_text = retry_text if self._is_plausible_plate_text(retry_text) else ""
-                    self.plate_det.last_read_conf = retry_conf
-                plate_bbox = candidate_bbox
-                print(f"  [SAWN] Snapshot plate: '{plate_text or '<empty>'}'")
-            else:
-                print("  [SAWN] Snapshot plate detection also missed")
-        _plate_display = plate_text or "<empty>"
-        _crop_display = "yes" if plate_crop is not None else "no"
-        print(f"  [SAWN] Final plate text: '{_plate_display}', crop={_crop_display}")
+                plate_text = candidate_text if self._is_plausible_plate_text(candidate_text) else ""
 
         clip_name = f"violation_{self._counter:04d}_clip.mp4"
         clip_path = self.out_dir / clip_name
@@ -1017,7 +716,6 @@ class SAWNDetector:
             plate_crop=plate_crop,
             plate_text=plate_text,
             video_path=str(clip_path),
-            plate_bbox=plate_bbox,
         )
         self._save_assets(violation)
         return violation
@@ -1052,10 +750,10 @@ class SAWNDetector:
 
                         self._counter += 1
                         snapshot = frame.copy()
-                        plate_crop, plate_text, plate_bbox = None, "", None
+                        plate_crop, plate_text = None, ""
                         result = self.plate_det.detect(snapshot)
                         if result:
-                            plate_crop, plate_text, plate_bbox = result
+                            plate_crop, plate_text = result
                             if not self._is_plausible_plate_text(plate_text):
                                 plate_text = ""
 
@@ -1067,7 +765,6 @@ class SAWNDetector:
                             snapshot=snapshot,
                             plate_crop=plate_crop,
                             plate_text=plate_text,
-                            plate_bbox=plate_bbox,
                         )
                         self._save_assets(violation)
                         violations.append(violation)
@@ -1104,26 +801,9 @@ class SAWNDetector:
         out.release()
 
     def _save_assets(self, violation: Violation):
-        # Save enhanced snapshot with optional plate detection overlay
-        snapshot_viz = violation.snapshot.copy()
-        
-        # If we detected a plate, add visual indicator on snapshot
-        if violation.plate_text and violation.plate_bbox is not None:
-            x1, y1, x2, y2 = violation.plate_bbox
-            # Draw green box around detected plate area
-            cv2.rectangle(snapshot_viz, (x1, y1), (x2, y2), (0, 255, 0), 3)
-            # Add label above box
-            label = f"Plate: {violation.plate_text}"
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            label_size = cv2.getTextSize(label, font, 0.7, 2)[0]
-            label_y = max(y1 - 10, label_size[1] + 10)
-            cv2.rectangle(snapshot_viz, (x1, label_y - label_size[1] - 10), 
-                         (x1 + label_size[0] + 10, label_y + 5), (0, 255, 0), -1)
-            cv2.putText(snapshot_viz, label, (x1 + 5, label_y), font, 0.7, (0, 0, 0), 2)
-        
         cv2.imwrite(
             str(self.out_dir / f"violation_{violation.id:04d}_snapshot.jpg"),
-            snapshot_viz,
+            violation.snapshot,
             [cv2.IMWRITE_JPEG_QUALITY, 98],
         )
         if violation.face_crop is not None:
