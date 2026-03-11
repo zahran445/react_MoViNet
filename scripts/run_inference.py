@@ -57,7 +57,7 @@ def run(args):
 
     det = SAWNDetector(
         movinet_path=args.movinet,
-        yolo_path=args.yolo,
+        plate_model_path=args.plate_model,
         output_dir=args.output,
     )
 
@@ -110,8 +110,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--source",     required=True,
                         help="Video path, folder (e.g. NewTest_VehicleLittering/), or webcam index")
-    parser.add_argument("--movinet",    default="models/movinet/movinet_best.keras")
-    parser.add_argument("--yolo",       default="models/yolov8/plates_yolov8/weights/best.pt")
+    parser.add_argument("--movinet",    default="models/movinet/movinet_best.pt")
+    parser.add_argument("--plate-model", default="models/yolo/plates_yolov8/weights/best.pt")
     parser.add_argument("--output",     default="outputs/violations")
     parser.add_argument("--log-to-web", action="store_true")
     parser.add_argument("--web-url",    default="http://localhost:5000")

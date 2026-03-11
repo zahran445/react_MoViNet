@@ -17,6 +17,8 @@ Usage:
 
 import argparse
 from pathlib import Path
+import os
+import torch
 import yaml
 
 
@@ -44,6 +46,7 @@ def train(args):
 
     data_dir  = Path(args.data).parent if args.data.endswith(".yaml") else Path(args.data)
     yaml_path = args.data if args.data.endswith(".yaml") else str(data_dir / "dataset.yaml")
+    device = 0 if torch.cuda.is_available() else "cpu"
 
     # Auto-generate YAML if it doesn't exist
     if not Path(yaml_path).exists():
@@ -51,26 +54,35 @@ def train(args):
         print("[INFO] Generating dataset.yaml from directory structure...")
         yaml_path = create_dataset_yaml(data_dir, Path(yaml_path))
 
-    out_dir = Path(args.output_dir)
+    out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n[MODEL] Loading YOLOv8{args.model_size}...")
-    model = YOLO(f"yolov8{args.model_size}.pt")  # auto-downloads pretrained weights
+    # Windows is prone to shared-memory/paging issues with many dataloader workers.
+    workers = args.workers
+    if workers is None:
+        workers = 0 if os.name == "nt" else 4
 
-    print(f"[TRAIN] Starting training | epochs={args.epochs} | imgsz={args.imgsz}")
+    print(f"\n[MODEL] Loading YOLOv8{args.model_size}...")
+    if args.resume:
+        model = YOLO(args.resume)
+    else:
+        model = YOLO(f"yolov8{args.model_size}.pt")  # auto-downloads pretrained weights
+
+    print(f"[TRAIN] Starting training | epochs={args.epochs} | imgsz={args.imgsz} | device={device}")
     results = model.train(
         data=yaml_path,
         epochs=args.epochs,
         imgsz=args.imgsz,
         batch=args.batch,
-        device=0,                     # GPU 0 (RTX 3060)
+        device=device,
         project=str(out_dir),
         name="plates_yolov8",
+        exist_ok=True,
         patience=15,                  # early stopping
         save=True,
         save_period=5,
         plots=True,
-        workers=4,
+        workers=workers,
         optimizer="AdamW",
         lr0=1e-3,
         weight_decay=5e-4,
@@ -85,6 +97,7 @@ def train(args):
         hsv_h=0.015,
         hsv_s=0.7,
         hsv_v=0.4,
+        resume=bool(args.resume),
         verbose=True,
     )
 
@@ -111,11 +124,13 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train YOLOv8 for license plate detection")
-    parser.add_argument("--data",       default="data/plates/dataset.yaml", help="Path to dataset.yaml")
-    parser.add_argument("--output_dir", default="models/yolov8",            help="Output directory")
+    parser.add_argument("--data",       default="new_license plate dataset/data.yaml", help="Path to dataset.yaml")
+    parser.add_argument("--output_dir", default="models/yolo",                      help="Output directory")
     parser.add_argument("--epochs",     type=int,   default=50,             help="Training epochs")
     parser.add_argument("--imgsz",      type=int,   default=640,            help="Image size")
     parser.add_argument("--batch",      type=int,   default=16,             help="Batch size")
     parser.add_argument("--model_size", default="n",                        help="YOLOv8 size: n/s/m/l/x")
+    parser.add_argument("--workers",    type=int,   default=None,            help="Dataloader workers (default: 0 on Windows, 4 on Linux/macOS)")
+    parser.add_argument("--resume",     default="",                         help="Path to last.pt to resume training")
     args = parser.parse_args()
     train(args)

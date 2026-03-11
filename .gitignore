@@ -25,15 +25,21 @@ ENV/
 
 # Datasets
 New_SawnDataset/
+new_license plate dataset/
 data/
 datasets/
 
 # Outputs
 outputs/
+uploads/
 violations/
 *.mp4
 *.avi
 *.mov
+
+# Training artifacts
+runs/
+wandb/
 
 # Logs
 logs/
@@ -69,3 +75,10 @@ sawn.db
 *.temp
 temp/
 tmp/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/

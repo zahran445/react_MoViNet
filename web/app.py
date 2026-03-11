@@ -321,7 +321,10 @@ def upload():
             with app.app_context():
                 try:
                     from utils.detector import SAWNDetector
-                    det = SAWNDetector(str(BASE_DIR/"models"/"movinet"/"movinet_best.pt"), str(BASE_DIR/"models"/"yolov8"/"plates_yolov8"/"weights"/"best.pt"))
+                    det = SAWNDetector(
+                        str(BASE_DIR / "models" / "movinet" / "movinet_best.pt"),
+                        str(BASE_DIR / "models" / "yolo" / "plates_yolov8" / "weights" / "best.pt")
+                    )
                     
                     def progress_cb(pct):
                         if fn in processing_jobs:
@@ -332,7 +335,7 @@ def upload():
                         rec = ViolationRecord(
                             timestamp=v.timestamp, violation_type=v.violation_type, confidence=float(v.confidence),
                             snapshot_path=str(Path(app.config["UPLOAD_FOLDER"])/f"violation_{v.id:04d}_snapshot.jpg"),
-                            face_path=str(Path(app.config["UPLOAD_FOLDER"])/f"violation_{v.id:04d}_face.jpg") if v.face_crop is not None else "",
+                            face_path="",
                             plate_path=str(Path(app.config["UPLOAD_FOLDER"])/f"violation_{v.id:04d}_plate.jpg") if v.plate_crop is not None else "",
                             video_path=v.video_path, plate_text=v.plate_text, status="PENDING"
                         )
