@@ -1,0 +1,14 @@
+[INFO] Training started...
+Epoch 1/9 - Loss: 0.052 - Accuracy: 0.938
+Epoch 2/9 - Loss: 0.065 - Accuracy: 0.918
+Epoch 3/9 - Loss: 0.021 - Accuracy: 0.967
+Epoch 4/9 - Loss: 0.012 - Accuracy: 0.980
+Epoch 5/9 - Loss: 0.005 - Accuracy: 0.988
+Epoch 6/9 - Loss: 0.004 - Accuracy: 0.990
+Epoch 7/9 - Loss: 0.025 - Accuracy: 0.973
+Epoch 8/9 - Loss: 0.028 - Accuracy: 0.968
+Epoch 9/9 - Loss: 0.015 - Accuracy: 0.983
+
+[INFO] Training completed successfully.
+Best Validation Accuracy: 99.3%
+Final Test Accuracy: 95.24%

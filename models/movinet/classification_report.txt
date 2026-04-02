@@ -1,0 +1,33 @@
+Classification Report - MoViNet Violation Classifier
+
+Dataset:
+- Training Videos: 840
+  - Pedestrian: 420
+  - Vehicle: 420
+- Test Videos: 170
+  - Pedestrian: 85
+  - Vehicle: 85
+
+Evaluation Results:
+----------------------------------------
+Accuracy    : 95.24%
+Precision   : 95.25%
+Recall      : 95.20%
+F1-Score    : 95.25%
+----------------------------------------
+
+Class-wise Performance:
+----------------------------------------
+Class        Precision    Recall    F1-Score    Support
+-------------------------------------------------------
+Pedestrian     0.963       0.940      0.952        84
+Vehicle        0.942       0.964      0.953        84
+-------------------------------------------------------
+
+Correct Predictions:
+- Pedestrian: 79 / 84
+- Vehicle   : 81 / 84
+
+Remarks:
+- Model performs consistently across both classes.
+- Slight confusion exists between pedestrian and vehicle cases.

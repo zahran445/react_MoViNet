@@ -1,0 +1,22 @@
+{
+  "accuracy": 0.9524,
+  "precision": 0.9525,
+  "recall": 0.9520,
+  "f1_score": 0.9525,
+  "classes": {
+    "pedestrian": {
+      "precision": 0.963,
+      "recall": 0.940,
+      "f1_score": 0.952,
+      "correct": 79,
+      "total": 84
+    },
+    "vehicle": {
+      "precision": 0.942,
+      "recall": 0.964,
+      "f1_score": 0.953,
+      "correct": 81,
+      "total": 84
+    }
+  }
+}
