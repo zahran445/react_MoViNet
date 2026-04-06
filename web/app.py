@@ -3,9 +3,18 @@ import sys
 import json
 import base64
 import threading
+import time
+from collections import deque
 from pathlib import Path
 from datetime import datetime
 import traceback
+
+# CRITICAL: Set FFMPEG options BEFORE importing cv2
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+
+import cv2
+import numpy as np
+import urllib.parse
 
 from flask import (
     Flask, render_template_string, jsonify,
@@ -34,6 +43,246 @@ Path(app.config["UPLOAD_FOLDER"]).mkdir(parents=True, exist_ok=True)
 Path(app.config["UPLOAD_VIDEO_FOLDER"]).mkdir(parents=True, exist_ok=True)
 
 processing_jobs = {} # Global job tracker
+live_stream_state = {
+    "running": False,
+    "lock": threading.Lock(),
+}
+live_detector = None
+live_face_detector = None
+live_sessions = {}
+LITTERING_LABELS = {"PedestrianLittering", "VehicleLittering"}
+
+
+def to_littering_label(label: str) -> str:
+    if "Pedestrian" in (label or ""):
+        return "PedestrianLittering"
+    return "VehicleLittering"
+
+
+
+
+def live_detection_decision(detector, window, raw_label: str, confidence: float):
+    """Decide whether the current live window is a genuine littering event.
+
+    Strategy:
+    - Both the model confidence AND the motion gate must pass.  There is
+      no fallback path so that idle standing / looking at the camera cannot
+      trigger a detection even at high confidence (the model has no
+      background class, so it always assigns the frame to one of the two
+      littering classes).
+    - For pedestrian events the motion must also resemble a throw-like burst
+      (sharp transient rise-then-fall), ruling out sustained walking motion.
+    """
+    # --- SMART AGENT MAPPING ---
+    # We use YOLO to tell us what the agent actually is, regardless of MoViNet's guess.
+    # This fixes cases where the model confuses Pedestrian vs Vehicle actions.
+    is_person = detector.obj_det.is_person_present(window[-1])
+    is_vehicle = detector.obj_det.is_vehicle_present(window[-1])
+    
+    final_label = raw_label
+    if is_person and not is_vehicle:
+        final_label = "PedestrianLittering"
+    elif is_vehicle and not is_person:
+        final_label = "VehicleLittering"
+    elif not is_person and not is_vehicle:
+        # No agent detected? Likely a false positive from lights/branch movement.
+        return False, "None"
+    
+    # Now that we've mapped the agent correctly, apply the corresponding threshold and action gate.
+    label_threshold = detector._label_threshold(final_label)
+    # Important: we use a slightly lower threshold (0.85) if we have strong YOLO presence confirmation.
+    effective_threshold = min(label_threshold, 0.85) 
+    
+    action_ok = detector._passes_action_gate(window, final_label)
+
+    if confidence > effective_threshold and action_ok:
+        return True, to_littering_label(final_label)
+
+    # No fallback path — require both confidence threshold AND motion gate.
+    return False, "None"
+
+
+def get_live_face_detector():
+    global live_face_detector
+    if live_face_detector is None:
+        from utils.detector import FaceDetector
+        live_face_detector = FaceDetector()
+    return live_face_detector
+
+
+def get_live_detector():
+    global live_detector
+    if live_detector is None:
+        from utils.detector import SAWNDetector
+        live_detector = SAWNDetector(
+            str(BASE_DIR / "models" / "movinet" / "movinet_best.pt"),
+            str(BASE_DIR / "models" / "yolo" / "plates_yolov8" / "weights" / "best.pt"),
+        )
+    return live_detector
+
+
+def save_video_clip(frames, fps, dst_path):
+    if not frames:
+        return False
+
+    height, width = frames[0].shape[:2]
+    target_height = 480
+    target_width = int(target_height * (width / max(1, height)))
+    fps = int(fps or 30)
+
+    fourcc = cv2.VideoWriter_fourcc(*"avc1")
+    writer = cv2.VideoWriter(dst_path, fourcc, fps, (target_width, target_height))
+    if not writer.isOpened():
+        writer = cv2.VideoWriter(dst_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (target_width, target_height))
+
+    if not writer.isOpened():
+        return False
+
+    for frame in frames:
+        writer.write(cv2.resize(frame, (target_width, target_height)))
+    writer.release()
+    return True
+
+
+def decode_data_url_image(data_url):
+    if not data_url or not isinstance(data_url, str):
+        return None
+    if "," in data_url:
+        data_url = data_url.split(",", 1)[1]
+    try:
+        raw = base64.b64decode(data_url)
+        arr = np.frombuffer(raw, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
+
+
+    except Exception:
+        return data
+
+
+def crypt_url(data: str, key: str = "abcd1234") -> str:
+    """Simple XOR encryption/decryption."""
+    if not data: return ""
+    res = "".join(chr(ord(c) ^ ord(key[i % len(key)])) for i, c in enumerate(data))
+    return res
+
+
+def decode_url(data: str) -> str:
+    """Base64 decode + XOR decrypt."""
+    if not data: return ""
+    try:
+        # Check if it looks like base64
+        raw = base64.b64decode(data).decode()
+        return crypt_url(raw)
+    except Exception:
+        return data
+
+
+def _safe_rtsp_url(url: str) -> str:
+    """Ensures password in RTSP URL is properly escaped for OpenCV."""
+    if not url or not url.startswith("rtsp://"):
+        return url
+    try:
+        # Standard parser might struggle with multiple '@', so we do a quick check
+        if url.count("@") > 1:
+            # Find the last '@' which separates credentials from host
+            creds_part, host_part = url[7:].rsplit("@", 1)
+            if ":" in creds_part:
+                user, passwd = creds_part.split(":", 1)
+                # Unquote once before quoting to prevent double-encoding (%40 -> %2540)
+                passwd = urllib.parse.unquote(passwd)
+                return f"rtsp://{user}:{urllib.parse.quote(passwd)}@{host_part}"
+        else:
+            parsed = urllib.parse.urlparse(url)
+            if parsed.password:
+                user = parsed.username
+                pw = urllib.parse.unquote(parsed.password) # Fix double encoding
+                pw = urllib.parse.quote(pw)
+                new_netloc = f"{user}:{pw}@{parsed.hostname}"
+                if parsed.port: new_netloc += f":{parsed.port}"
+                return parsed._replace(netloc=new_netloc).geturl()
+    except Exception:
+        pass
+    return url
+
+
+def get_live_session(session_id: str):
+    with live_stream_state["lock"]:
+        session = live_sessions.get(session_id)
+        if session is None:
+            session = {
+                "recent_frames": deque(maxlen=45),
+                "clip_active": False,
+                "clip_frames": [],
+                "clip_target_frames": 0,
+                "last_violation_time": 0.0,
+                "last_analysis_time": 0.0,
+                "last_label": "None",
+                "last_conf": 0.0,
+                "analysis_count": 0,
+                "analysis_stride": 3,
+                "fps_estimate": 5,
+            }
+            live_sessions[session_id] = session
+        return session
+
+
+def persist_live_violation(detector, clip_frames, fps, snapshot, plate_crop, face_crop, plate_text, plate_bbox, violation_type, confidence):
+    if snapshot is None or not clip_frames:
+        return None
+
+    if violation_type not in LITTERING_LABELS:
+        return None
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    snapshot_viz = snapshot.copy()
+    if plate_bbox is not None:
+        x1, y1, x2, y2 = plate_bbox
+        cv2.rectangle(snapshot_viz, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        if plate_text:
+            label = f"Plate: {plate_text}"
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            label_y = max(y1 - 10, label_size[1] + 10)
+            cv2.rectangle(snapshot_viz, (x1, label_y - label_size[1] - 10), (x1 + label_size[0] + 10, label_y + 5), (0, 255, 0), -1)
+            cv2.putText(snapshot_viz, label, (x1 + 5, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+
+    with app.app_context():
+        record = ViolationRecord(
+            timestamp=timestamp,
+            violation_type=violation_type,
+            confidence=float(confidence),
+            snapshot_path="",
+            face_path="",
+            plate_path="",
+            video_path="",
+            plate_text=plate_text or "",
+            status="PENDING",
+        )
+        db.session.add(record)
+        db.session.commit()
+
+        base_name = f"violation_{record.id:04d}"
+        snapshot_path = Path(app.config["UPLOAD_FOLDER"]) / f"{base_name}_snapshot.jpg"
+        face_path = Path(app.config["UPLOAD_FOLDER"]) / f"{base_name}_face.jpg"
+        plate_path = Path(app.config["UPLOAD_FOLDER"]) / f"{base_name}_plate.jpg"
+        clip_path = Path(app.config["UPLOAD_FOLDER"]) / f"{base_name}_clip.mp4"
+
+        cv2.imwrite(str(snapshot_path), snapshot_viz, [cv2.IMWRITE_JPEG_QUALITY, 98])
+        if face_crop is not None:
+            cv2.imwrite(str(face_path), face_crop, [cv2.IMWRITE_JPEG_QUALITY, 98])
+        if plate_crop is not None:
+            cv2.imwrite(str(plate_path), plate_crop, [cv2.IMWRITE_JPEG_QUALITY, 100])
+
+        save_video_clip(clip_frames, fps, str(clip_path))
+
+        record.snapshot_path = str(snapshot_path)
+        record.face_path = str(face_path) if face_crop is not None else ""
+        record.plate_path = str(plate_path) if plate_crop is not None else ""
+        record.video_path = str(clip_path)
+        db.session.commit()
+
+    return record
 
 # ── Database Models ────────────────────────────────────────────────────────
 
@@ -104,6 +353,7 @@ BASE_HTML = """
         .btn-accent { background: var(--accent); color: #000; }
         .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text-main); }
         .btn-red { background: var(--red); color: #fff; }
+        .btn-blue { background: var(--blue); color: #fff; }
 
         .content { padding: 40px; max-width: 1400px; }
         .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 24px; margin-bottom: 40px; }
@@ -174,12 +424,28 @@ BASE_HTML = """
         .progress-bar { height: 100%; width: 100%; background: linear-gradient(90deg, transparent, var(--accent), transparent); background-size: 200% 100%; animation: moveGradient 2s linear infinite; position: relative; }
         .progress-bar::after { content: ''; position: absolute; inset: 0; background-image: linear-gradient(90deg, var(--card-bg) 2px, transparent 2px); background-size: 8px 100%; }
         @keyframes moveGradient { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+
+        .live-shell { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(320px, 0.6fr); gap: 24px; align-items: start; }
+        .live-panel, .live-side { background: var(--card-bg); border: 1px solid var(--border); border-radius: 20px; overflow: hidden; }
+        .live-panel { padding: 16px; }
+        .live-frame { width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 14px; overflow: hidden; border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; }
+        .live-frame img { width: 100%; height: 100%; object-fit: contain; }
+        .live-side { padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+        .live-metric { padding: 16px; border-radius: 14px; background: rgba(255,255,255,0.03); border: 1px solid var(--border); }
+        .live-label { font-size: 12px; color: var(--text-dim); text-transform: uppercase; margin-bottom: 6px; }
+        .live-value { font-size: 28px; font-weight: 700; }
+        .live-note { color: var(--text-dim); font-size: 14px; line-height: 1.5; }
+
+        @media (max-width: 980px) {
+            .live-shell { grid-template-columns: 1fr; }
+        }
     </style>
 </head>
 <body>
     <nav class="sidebar">
         <div class="logo"><div class="logo-box">R</div><h2>REACT</h2></div>
-        <a href="/" class="nav-item active">🏠 Dashboard</a>
+        <a href="/" class="nav-item {{ 'active' if active_page == 'home' else '' }}">🏠 Dashboard</a>
+        <a href="/live" class="nav-item {{ 'active' if active_page == 'live' else '' }}">📷 Live Stream</a>
         <a href="/upload" class="nav-item">📤 Upload Video</a>
     </nav>
 
@@ -187,6 +453,7 @@ BASE_HTML = """
         <header class="header">
             <h1 id="page-title">{{ title }}</h1>
             <div style="display:flex; gap:12px">
+                <a href="/live" class="btn btn-blue">📷 Live Stream</a>
                 <a href="/upload" class="btn btn-accent">📤 Upload</a>
                 <button class="btn btn-outline">Logout</button>
             </div>
@@ -349,7 +616,597 @@ HOME_HTML = BASE_HTML.replace("{% block content %}{% endblock %}", """
 """)
 
 @app.route("/")
-def home(): return render_template_string(HOME_HTML, title="Dashboard")
+def home(): return render_template_string(HOME_HTML, title="Dashboard", active_page="home")
+
+
+LIVE_HTML = BASE_HTML.replace("{% block content %}{% endblock %}", """
+<div class="live-shell">
+    <div class="live-panel">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:16px; flex-wrap:wrap;">
+            <div>
+                <h2 style="font-size:24px; margin-bottom:4px;">Live Webcam Stream</h2>
+                <p style="color: var(--text-dim); font-size:14px;">Choose a browser webcam or an RTSP connected camera and run the live models on the selected source.</p>
+            </div>
+            <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+                <select id="stream-mode" class="btn btn-outline" style="min-width:180px; padding:10px 14px; color:var(--text-main); background:transparent;">
+                    <option value="webcam">Browser Webcam</option>
+                    <option value="rtsp">RTSP Camera</option>
+                </select>
+                <select id="camera-select" class="btn btn-outline" style="min-width:220px; padding:10px 14px; color:var(--text-main); background:transparent;"></select>
+                <input id="rtsp-url" type="text" placeholder="rtsp://user:pass@host:554/stream" style="min-width:320px; padding:10px 14px; border-radius:8px; border:1px solid var(--border); background:transparent; color:var(--text-main); display:none;">
+                <button class="btn btn-blue" onclick="startLive()">▶ Start Live</button>
+                <button class="btn btn-outline" onclick="stopLive()">■ Stop</button>
+            </div>
+        </div>
+
+        <div class="live-frame">
+            <video id="live-video" autoplay muted playsinline style="width:100%; height:100%; object-fit:contain; background:#000;"></video>
+            <img id="rtsp-video" alt="RTSP live stream" style="width:100%; height:100%; object-fit:contain; background:#000; display:none;">
+            <canvas id="live-canvas" style="display:none;"></canvas>
+        </div>
+    </div>
+
+    <aside class="live-side">
+        <div class="live-metric">
+            <div class="live-label">Status</div>
+            <div class="live-value" id="live-status">Idle</div>
+        </div>
+        <div class="live-metric">
+            <div class="live-label">Latest Label</div>
+            <div class="live-value" id="live-label">--</div>
+        </div>
+        <div class="live-metric">
+            <div class="live-label">Confidence</div>
+            <div class="live-value" id="live-conf">0%</div>
+        </div>
+        <div class="live-metric">
+            <div class="live-label">Plate</div>
+            <div class="live-value" id="live-plate" style="font-size:18px;">--</div>
+        </div>
+        <div class="live-metric">
+            <div class="live-label">How it works</div>
+            <div class="live-note">The browser shows the camera feed directly. Every sampled frame is analyzed on the server with the SAWN classifier, plate detector, and face detector. If a violation is detected, a 5-second clip is saved and appears in the dashboard list.</div>
+        </div>
+    </aside>
+</div>
+
+<script>
+    const liveStatus = document.getElementById('live-status');
+    const liveLabel = document.getElementById('live-label');
+    const liveConf = document.getElementById('live-conf');
+    const livePlate = document.getElementById('live-plate');
+    const liveVideo = document.getElementById('live-video');
+    const rtspVideo = document.getElementById('rtsp-video');
+    const liveCanvas = document.getElementById('live-canvas');
+    const liveCtx = liveCanvas.getContext('2d');
+    const streamMode = document.getElementById('stream-mode');
+    const cameraSelect = document.getElementById('camera-select');
+    const rtspUrlInput = document.getElementById('rtsp-url');
+
+    let liveStream = null;
+    let liveTimer = null;
+    let sessionId = crypto.randomUUID();
+    let sending = false;
+    let selectedDeviceId = '';
+    let currentRtspUrl = '';
+
+    function updateModeUi(){
+        const mode = streamMode.value;
+        cameraSelect.style.display = mode === 'webcam' ? 'inline-flex' : 'none';
+        rtspUrlInput.style.display = mode === 'rtsp' ? 'inline-block' : 'none';
+        liveVideo.style.display = mode === 'webcam' ? 'block' : 'none';
+        rtspVideo.style.display = mode === 'rtsp' ? 'block' : 'none';
+    }
+
+    async function loadCameraDevices(){
+        try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const cameras = devices.filter(device => device.kind === 'videoinput');
+            cameraSelect.innerHTML = cameras.map((device, index) => {
+                const label = device.label || `Camera ${index + 1}`;
+                return `<option value="${device.deviceId}">${label}</option>`;
+            }).join('');
+            if (cameras.length) {
+                selectedDeviceId = cameras[0].deviceId;
+                cameraSelect.value = selectedDeviceId;
+            }
+        } catch (err) {
+            console.error(err);
+        }
+    }
+
+    function cryptUrl(data, key = "abcd1234") {
+        let out = "";
+        for (let i = 0; i < data.length; i++) {
+            out += String.fromCharCode(data.charCodeAt(i) ^ key.charCodeAt(i % key.length));
+        }
+        return btoa(out);
+    }
+
+    async function startLive(){
+        stopLive();
+        const mode = streamMode.value;
+        try {
+            if (mode === 'webcam') {
+                const constraints = selectedDeviceId
+                    ? { video: { deviceId: { exact: selectedDeviceId } }, audio: false }
+                    : { video: true, audio: false };
+                liveStream = await navigator.mediaDevices.getUserMedia(constraints);
+                liveVideo.srcObject = liveStream;
+                liveStatus.textContent = 'Running (webcam)';
+                liveTimer = setInterval(sendFrame, 200);
+            } else {
+                const rtspUrl = rtspUrlInput.value.trim();
+                if (!rtspUrl) {
+                    liveStatus.textContent = 'RTSP URL required';
+                    return;
+                }
+                currentRtspUrl = rtspUrl;
+                // Camera networking begins here: the browser opens the RTSP live feed served by Flask.
+                const encUrl = cryptUrl(rtspUrl);
+                console.log("[RTSP] Feed request initiated: (encrypted)", encUrl);
+                
+                // Add an error handler to retry if the browser fails to load the MJPEG stream
+                rtspVideo.onerror = () => {
+                    console.warn("[RTSP] Browser stream error. Retrying in 2s...");
+                    setTimeout(() => {
+                        if (currentRtspUrl) rtspVideo.src = `/live_feed_rtsp?url=${encodeURIComponent(encUrl)}&ts=${Date.now()}`;
+                    }, 2000);
+                };
+                
+                rtspVideo.src = `/live_feed_rtsp?url=${encodeURIComponent(encUrl)}&ts=${Date.now()}`;
+                liveStatus.textContent = 'Running (RTSP)';
+            }
+        } catch (err) {
+            liveStatus.textContent = 'Camera blocked';
+            console.error(err);
+        }
+    }
+
+    function stopLive(){
+        if (liveTimer) {
+            clearInterval(liveTimer);
+            liveTimer = null;
+        }
+        if (liveStream) {
+            liveStream.getTracks().forEach(track => track.stop());
+            liveStream = null;
+        }
+        liveVideo.srcObject = null;
+        rtspVideo.src = '';
+        liveStatus.textContent = 'Stopped';
+        liveLabel.textContent = '--';
+        liveConf.textContent = '0%';
+        livePlate.textContent = '--';
+    }
+
+    async function sendFrame(){
+        if (!liveVideo.videoWidth || !liveVideo.videoHeight || sending) return;
+        sending = true;
+        try {
+            // Camera networking continues here: a sampled webcam frame is encoded and sent to the server.
+            liveCanvas.width = liveVideo.videoWidth;
+            liveCanvas.height = liveVideo.videoHeight;
+            liveCtx.drawImage(liveVideo, 0, 0, liveCanvas.width, liveCanvas.height);
+            const dataUrl = liveCanvas.toDataURL('image/jpeg', 0.75);
+            // Camera networking continues here: the sampled browser frame is uploaded to the server for inference.
+            const res = await fetch('/api/live_frame', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ session_id: sessionId, image: dataUrl })
+            });
+            if (!res.ok) return;
+            const data = await res.json();
+            if (data.status) liveStatus.textContent = data.status;
+            if (data.label) liveLabel.textContent = data.label;
+            if (typeof data.confidence === 'number') liveConf.textContent = `${data.confidence.toFixed(1)}%`;
+            if (data.plate_text !== undefined) livePlate.textContent = data.plate_text || '--';
+        } catch (err) {
+            console.error(err);
+        } finally {
+            sending = false;
+        }
+    }
+
+    cameraSelect.addEventListener('change', async () => {
+        selectedDeviceId = cameraSelect.value;
+        if (streamMode.value === 'webcam') {
+            stopLive();
+            await startLive();
+        }
+    });
+
+    streamMode.addEventListener('change', () => {
+        updateModeUi();
+        stopLive();
+    });
+
+    navigator.mediaDevices?.addEventListener?.('devicechange', loadCameraDevices);
+    updateModeUi();
+    loadCameraDevices();
+
+</script>
+""")
+
+
+@app.route("/live")
+def live():
+    return render_template_string(LIVE_HTML, title="Live Stream", active_page="live")
+
+
+def _encode_frame(frame):
+    ret, buffer = cv2.imencode('.jpg', frame)
+    if not ret:
+        return None
+    return buffer.tobytes()
+
+
+def _rtsp_cap(url: str):
+    # Camera networking on the server side happens here: OpenCV opens the RTSP URL as a live source.
+    print(f"\n[RTSP] >>> Connecting to: {url[:15]}... (password hidden)")
+    safe_url = _safe_rtsp_url(url)
+    
+    if hasattr(cv2, "CAP_FFMPEG"):
+        print(f"[RTSP] Using FFMPEG backend with TCP transport...")
+        cap = cv2.VideoCapture(safe_url, cv2.CAP_FFMPEG)
+        # 5 second timeout for opening
+        cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+        # Reduce buffer size to minimum to avoid lag/black frames
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        # Stabilization period: wait for the encoder to sync
+        time.sleep(1.0) 
+    else:
+        print(f"[RTSP] Using default backend...")
+        cap = cv2.VideoCapture(safe_url)
+        
+    if cap.isOpened():
+        print(f"[RTSP] SUCCESS: Stream opened! Processing frames...")
+    else:
+        print(f"[RTSP] ERROR: Failed to open stream at {safe_url[:20]}...")
+        
+    return cap
+
+
+def _stream_live_source(cap, source_name: str):
+    detector = get_live_detector()
+    face_detector = get_live_face_detector()
+
+    if not cap.isOpened():
+        print(f"[RTSP] Failed to open: {source_name}")
+        frame = 255 * np.ones((480, 854, 3), dtype='uint8')
+        cv2.putText(frame, f'Could not open {source_name}', (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+        encoded = _encode_frame(frame)
+        if encoded:
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + encoded + b'\r\n')
+        return
+
+    # Initial Sync: Discard the first 200 frames of "junk" buffer data to catch a clean Keyframe
+    print(f"[RTSP] Super-Syncing with camera... discarding 200 frames.")
+    for _ in range(200): cap.grab()
+
+    fps = int(cap.get(cv2.CAP_PROP_FPS) or 30)
+    analysis_stride = max(1, fps // 2)
+    recent_frames = deque(maxlen=max(int(fps * 2), 30))
+    clip_session = None
+    last_label = 'None'
+    last_conf = 0.0
+    last_violation_time = 0.0
+    cooldown = 5.0
+    frame_index = 0
+
+    try:
+        error_count = 0
+        while True:
+            # Buffer clearing: grab many frames to reach the most recent one (low latency)
+            for _ in range(10): 
+                cap.grab() 
+            
+            success, frame = cap.read()
+            if not success:
+                error_count += 1
+                if error_count > 60: # Stop if we can't read for ~3 seconds
+                    print(f"[RTSP] Fatal: Persistent read error. Closing stream.")
+                    break
+                time.sleep(0.01) # Small delay to let the camera buffer refill
+                continue
+            
+            error_count = 0 # Reset on every successful frame
+            recent_frames.append(frame.copy())
+
+            if clip_session is not None:
+                clip_session["frames"].append(frame.copy())
+                if len(clip_session["frames"]) >= clip_session["target_frames"]:
+                    persist_live_violation(
+                        detector=detector,
+                        clip_frames=clip_session["frames"],
+                        fps=fps,
+                        snapshot=clip_session["snapshot"],
+                        plate_crop=clip_session["plate_crop"],
+                        face_crop=clip_session["face_crop"],
+                        plate_text=clip_session["plate_text"],
+                        plate_bbox=clip_session["plate_bbox"],
+                        violation_type=clip_session["violation_type"],
+                        confidence=clip_session["confidence"],
+                    )
+                    clip_session = None
+                    last_violation_time = time.time()
+
+            display = frame.copy()
+            if len(recent_frames) >= 16 and frame_index % analysis_stride == 0:
+                window = list(recent_frames)[-16:]
+                label, conf = detector.classifier.predict_segment(window)
+                is_detected, detected_label = live_detection_decision(detector, window, label, conf)
+
+                if is_detected:
+                    last_label = detected_label
+                    last_conf = conf
+                    cv2.putText(display, f'{last_label} ({conf:.1%})', (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                else:
+                    last_label = 'None'
+                    last_conf = 0.0
+                    cv2.putText(display, 'None (0.0%)', (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
+
+                if clip_session is None and is_detected and (time.time() - last_violation_time) > cooldown:
+                    snapshot = frame.copy()
+                    plate_crop = None
+                    plate_text = ""
+                    plate_bbox = None
+                    face_crop = face_detector.detect(snapshot)
+                    result = detector.plate_det.detect(snapshot)
+                    if result:
+                        plate_crop, plate_text, plate_bbox = result
+                        if plate_bbox is not None:
+                            x1, y1, x2, y2 = plate_bbox
+                            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            if plate_text:
+                                cv2.putText(display, plate_text, (x1, max(25, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    clip_session = {
+                        "frames": list(recent_frames),
+                        "target_frames": max(int(fps * 5), len(recent_frames)),
+                        "snapshot": snapshot,
+                        "face_crop": face_crop,
+                        "plate_crop": plate_crop,
+                        "plate_text": plate_text if detector._is_plausible_plate_text(plate_text) else "",
+                        "plate_bbox": plate_bbox,
+                        "violation_type": detected_label,
+                        "confidence": conf,
+                    }
+                    last_violation_time = time.time()
+                    cv2.putText(display, 'Saving 5s clip...', (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+            cv2.putText(display, source_name, (20, display.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            if clip_session is not None:
+                cv2.putText(display, f"REC {len(clip_session['frames'])}/{clip_session['target_frames']}", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            encoded = _encode_frame(display)
+            if not encoded:
+                continue
+
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + encoded + b'\r\n')
+            frame_index += 1
+    finally:
+        cap.release()
+
+
+def live_frame_generator():
+    detector = get_live_detector()
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW) if hasattr(cv2, "CAP_DSHOW") else cv2.VideoCapture(0)
+    if not cap.isOpened():
+        frame = 255 * np.ones((480, 854, 3), dtype='uint8')
+        cv2.putText(frame, 'Could not open webcam', (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+        encoded = _encode_frame(frame)
+        if encoded:
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + encoded + b'\r\n')
+        return
+
+    fps = int(cap.get(cv2.CAP_PROP_FPS) or 30)
+    analysis_stride = max(1, fps // 2)
+    recent_frames = deque(maxlen=max(int(fps * 2), 30))
+    clip_session = None
+    last_label = 'None'
+    last_conf = 0.0
+    last_violation_time = 0.0
+    cooldown = 5.0
+    frame_index = 0
+
+    try:
+        while True:
+            success, frame = cap.read()
+            if not success:
+                break
+
+            recent_frames.append(frame.copy())
+
+            if clip_session is not None:
+                clip_session["frames"].append(frame.copy())
+                if len(clip_session["frames"]) >= clip_session["target_frames"]:
+                    persist_live_violation(
+                        detector=detector,
+                        clip_frames=clip_session["frames"],
+                        fps=fps,
+                        snapshot=clip_session["snapshot"],
+                        plate_crop=clip_session["plate_crop"],
+                        plate_text=clip_session["plate_text"],
+                        plate_bbox=clip_session["plate_bbox"],
+                        violation_type=clip_session["violation_type"],
+                        confidence=clip_session["confidence"],
+                    )
+                    clip_session = None
+                    last_violation_time = time.time()
+
+            display = frame.copy()
+            if len(recent_frames) >= 16 and frame_index % analysis_stride == 0:
+                window = list(recent_frames)[-16:]
+                label, conf = detector.classifier.predict_segment(window)
+                is_detected, detected_label = live_detection_decision(detector, window, label, conf)
+
+                if is_detected:
+                    last_label = detected_label
+                    last_conf = conf
+                    cv2.putText(display, f'{last_label} ({conf:.1%})', (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                else:
+                    last_label = 'None'
+                    last_conf = 0.0
+                    cv2.putText(display, 'None (0.0%)', (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
+
+                if clip_session is None and is_detected and (time.time() - last_violation_time) > cooldown:
+                    snapshot = frame.copy()
+                    plate_crop = None
+                    plate_text = ""
+                    plate_bbox = None
+                    result = detector.plate_det.detect(snapshot)
+                    if result:
+                        plate_crop, plate_text, plate_bbox = result
+                        if plate_bbox is not None:
+                            x1, y1, x2, y2 = plate_bbox
+                            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                            if plate_text:
+                                cv2.putText(display, plate_text, (x1, max(25, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    clip_session = {
+                        "frames": list(recent_frames),
+                        "target_frames": max(int(fps * 5), len(recent_frames)),
+                        "snapshot": snapshot,
+                        "plate_crop": plate_crop,
+                        "plate_text": plate_text if detector._is_plausible_plate_text(plate_text) else "",
+                        "plate_bbox": plate_bbox,
+                        "violation_type": detected_label,
+                        "confidence": conf,
+                    }
+                    last_violation_time = time.time()
+                    cv2.putText(display, 'Saving 5s clip...', (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
+            cv2.putText(display, 'LIVE CAMERA', (20, display.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            if clip_session is not None:
+                cv2.putText(display, f"REC {len(clip_session['frames'])}/{clip_session['target_frames']}", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            encoded = _encode_frame(display)
+            if not encoded:
+                continue
+
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + encoded + b'\r\n')
+            frame_index += 1
+    finally:
+        cap.release()
+
+
+@app.route("/live_feed")
+def live_feed():
+    return Response(live_frame_generator(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route("/live_feed_rtsp")
+def live_feed_rtsp():
+    raw_url = request.args.get("url", "").strip()
+    if not raw_url:
+        return jsonify({"ok": False, "error": "Missing RTSP URL"}), 400
+    
+    # Decrypt if encrypted (user provided code abcd1234)
+    rtsp_url = decode_url(raw_url)
+    cap = _rtsp_cap(rtsp_url)
+    return Response(_stream_live_source(cap, "RTSP camera"), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+@app.route("/api/live_frame", methods=["POST"])
+def api_live_frame():
+    payload = request.get_json(silent=True) or {}
+    session_id = payload.get("session_id") or "default"
+    image = decode_data_url_image(payload.get("image"))
+    if image is None:
+        return jsonify({"ok": False, "status": "No frame"}), 400
+
+    detector = get_live_detector()
+    face_detector = get_live_face_detector()
+    session = get_live_session(session_id)
+
+    now = time.time()
+    if session["last_analysis_time"]:
+        elapsed = max(0.05, now - session["last_analysis_time"])
+        estimated_fps = 1.0 / elapsed
+        session["fps_estimate"] = max(2, min(10, int(round(estimated_fps))))
+    session["last_analysis_time"] = now
+
+    session["recent_frames"].append(image.copy())
+    if session["clip_active"]:
+        session["clip_frames"].append(image.copy())
+
+    label = "None"
+    confidence = 0.0
+    plate_text = ""
+    face_detected = False
+    saved = False
+
+    if len(session["recent_frames"]) >= 16:
+        window = list(session["recent_frames"])[-16:]
+        raw_label, confidence = detector.classifier.predict_segment(window)
+
+        is_detected, detected_label = live_detection_decision(detector, window, raw_label, confidence)
+
+        if is_detected:
+            label = detected_label
+            session["last_label"] = label
+            session["last_conf"] = confidence
+            cv2.putText(image, f"{label} ({confidence:.1%})", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            if session["clip_active"] is False and (now - session["last_violation_time"]) > 5.0:
+                snapshot = image.copy()
+                face_crop = face_detector.detect(snapshot)
+                face_detected = face_crop is not None
+
+                plate_crop = None
+                plate_bbox = None
+                plate_result = detector.plate_det.detect(snapshot)
+                if plate_result:
+                    plate_crop, plate_text, plate_bbox = plate_result
+                    if not detector._is_plausible_plate_text(plate_text):
+                        plate_text = ""
+                else:
+                    plate_text = ""
+
+                session["clip_active"] = True
+                session["clip_frames"] = list(session["recent_frames"])
+                session["clip_target_frames"] = max(10, int(session["fps_estimate"] * 5))
+                session["snapshot"] = snapshot
+                session["face_crop"] = face_crop
+                session["plate_crop"] = plate_crop
+                session["plate_text"] = plate_text
+                session["plate_bbox"] = plate_bbox
+                session["violation_type"] = label
+                session["confidence"] = session["last_conf"]
+        else:
+            label = "None"
+            confidence = 0.0
+            session["last_label"] = "None"
+            session["last_conf"] = 0.0
+
+        if session["clip_active"] and len(session["clip_frames"]) >= session["clip_target_frames"]:
+            record = persist_live_violation(
+                detector=detector,
+                clip_frames=session["clip_frames"],
+                fps=session["fps_estimate"],
+                snapshot=session.get("snapshot"),
+                plate_crop=session.get("plate_crop"),
+                face_crop=session.get("face_crop"),
+                plate_text=session.get("plate_text", ""),
+                plate_bbox=session.get("plate_bbox"),
+                violation_type=session.get("violation_type", "VehicleLittering"),
+                confidence=session.get("confidence", confidence),
+            )
+            session["clip_active"] = False
+            session["clip_frames"] = []
+            session["last_violation_time"] = now
+            saved = record is not None
+
+    face_result = face_detector.detect(image)
+    face_detected = face_detected or (face_result is not None)
+
+    return jsonify({
+        "ok": True,
+        "status": "Saving clip" if session["clip_active"] else "Running",
+        "label": label,
+        "confidence": round(float(confidence) * 100, 1),
+        "plate_text": plate_text,
+        "face_detected": face_detected,
+        "clip_active": session["clip_active"],
+        "clip_saved": saved,
+    })
 
 @app.route("/upload", methods=["GET", "POST"])
 def upload():
@@ -470,7 +1327,7 @@ def upload():
             }
         };
     </script>
-    """), title="Upload")
+    """), title="Upload", active_page="upload")
 
 @app.route("/api/processing_status")
 def api_status():
@@ -513,6 +1370,9 @@ def api_delete_violation(vid):
 
 @app.route("/api/violations/all", methods=["DELETE"])
 def api_clear_all_violations():
+    ViolationRecord.query.delete()
+    db.session.commit()
+    return jsonify({"ok": True})
     ViolationRecord.query.delete()
     db.session.commit()
     return jsonify({"ok": True})

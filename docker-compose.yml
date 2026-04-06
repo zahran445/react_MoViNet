@@ -9,24 +9,26 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      # Persist outputs (clips, snapshots, uploads, DB)
+      # Persist runtime data (clips, snapshots, uploads, logs)
       - ./outputs:/app/outputs
-      - ./models:/app/models
+      # Persist the primary record database
+      - ./sawn.db:/app/sawn.db
+      
+      # NOTE: Models are now baked into the image. 
+      # Mount this ONLY if you want to override internal weights from the host.
+      # - ./models:/app/models
+    
     environment:
-      # Flask runs as plain Python script; these are here if you later switch to flask run
       - FLASK_ENV=production
+      # - CUDA_VISIBLE_DEVICES=0  # Uncomment if using GPU
     restart: unless-stopped
 
-    # For GPU acceleration (optional):
-    # Uncomment the section below and make sure you have:
-    # - Docker Desktop with WSL2 + NVIDIA GPU support
-    # - The nvidia-container-toolkit installed
-    #
+    # ── GPU ACCELERATION (Uncomment for NVIDIA GPUs) ──────────────────────────
     # deploy:
     #   resources:
     #     reservations:
     #       devices:
     #         - capabilities: ["gpu"]
-    #           driver: nvidia
-    #           count: 1
+    #           driver: nvidia 
+    #           count: all
 

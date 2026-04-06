@@ -127,7 +127,7 @@ def build_model(num_classes=NUM_CLASSES, args=None):
     in_feats = model.fc.in_features
     model.fc = nn.Linear(in_feats, num_classes)
     
-    if args.resume:
+    if args and args.resume:
         if os.path.exists(args.resume):
             print(f"[MODEL] Resuming from checkpoint: {args.resume}")
             model.load_state_dict(torch.load(args.resume, map_location=DEVICE))

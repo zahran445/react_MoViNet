@@ -97,7 +97,7 @@ class MoViNetClassifier:
     def _load_model(self, model_path: str):
         model = vid_models.r3d_18(weights=None)
         in_feats = model.fc.in_features
-        model.fc = nn.Linear(in_feats, 2)
+        model.fc = nn.Linear(in_feats, len(CLASS_NAMES))
         try:
             model.load_state_dict(torch.load(model_path, map_location=self.device))
         except Exception as exc:
@@ -123,11 +123,15 @@ class MoViNetClassifier:
     @torch.no_grad()
     def predict_segment(self, frames: List[np.ndarray]) -> tuple[str, float]:
         if len(frames) < self.N_FRAMES:
-            return CLASS_NAMES[0], 0.0
+            # Not enough frames
+            return "Unknown", 0.0
         logits = self.model(self.preprocess_clip(frames))
         probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
         idx = int(np.argmax(probs))
-        return CLASS_NAMES[idx], float(probs[idx])
+        # Guard: if idx is out of range of CLASS_NAMES (e.g. old 2-class model
+        # loaded while code expects 3+ classes) fall back to the first class.
+        label = CLASS_NAMES[idx] if idx < len(CLASS_NAMES) else CLASS_NAMES[0]
+        return label, float(probs[idx])
 
 
 class PlateDetector:
@@ -371,6 +375,7 @@ class PlateDetector:
 
         gauss = cv2.GaussianBlur(boosted, (0, 0), 1.1)
         sharpened = cv2.addWeighted(boosted, 1.35, gauss, -0.35, 0)
+
 
         _, binary_otsu = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         binary_adapt = cv2.adaptiveThreshold(
@@ -660,14 +665,25 @@ class PlateDetector:
                     best_bbox = (x1, y1, x2, y2)
                 continue
 
+            # Skip expensive OCR on very weak detections to avoid long stalls on no-plate clips.
+            if det_conf < 0.22 and det_score < 1.8:
+                if best_crop is None:
+                    best_crop = self._enhance_plate_for_display(warped, "")
+                    best_bbox = (x1, y1, x2, y2)
+                print(f"    [PlateDetector] bbox=({x1},{y1},{x2},{y2}) weak det_conf={det_conf:.2f} det_score={det_score:.2f} -> skipping OCR")
+                continue
+
             print(f"    [PlateDetector] bbox=({x1},{y1},{x2},{y2}) det_conf={det_conf:.2f} sharpness={sharpness:.1f} -> running OCR")
             plate_text = self._read_plate_text(warped)
             ocr_conf = float(self.last_read_conf)
             if not self._accept_plate_text(plate_text, ocr_conf):
-                retry_text, retry_conf = self._retry_plate_text(warped)
-                if retry_text and retry_conf >= ocr_conf:
-                    plate_text = retry_text
-                    ocr_conf = retry_conf
+                # Retry OCR only for promising first-pass reads.
+                should_retry = bool(plate_text) or ocr_conf >= 0.12
+                if should_retry:
+                    retry_text, retry_conf = self._retry_plate_text(warped)
+                    if retry_text and retry_conf >= ocr_conf:
+                        plate_text = retry_text
+                        ocr_conf = retry_conf
             print(f"    [PlateDetector] OCR result: '{plate_text}' conf={ocr_conf:.3f} valid={self._accept_plate_text(plate_text, ocr_conf)}")
             valid_bonus = 1.5 if self._accept_plate_text(plate_text, ocr_conf) else 0.0
             score = det_score + (ocr_conf * 4.0) + valid_bonus + det_conf
@@ -690,6 +706,56 @@ class PlateDetector:
         return best_crop, best_text, best_bbox
 
 
+class GeneralObjectDetector:
+    def __init__(self, model_path: str = "yolov8n.pt", conf: float = 0.40):
+        self.conf = conf
+        self.model = None
+        self.face_det = FaceDetector() # NEW: Fallback face detector
+        if YOLO is not None:
+            try:
+                # Use current directory or local file if possible
+                self.model = YOLO(model_path)
+                print(f"[GeneralDetector] Loaded YOLO model from {model_path}")
+            except Exception as exc:
+                print(f"[GeneralDetector] Warning: failed to load model - {exc}")
+
+    def is_vehicle_present(self, frame: np.ndarray) -> bool:
+        return self._is_present(frame, [2, 3, 5, 7])
+
+    def is_person_present(self, frame: np.ndarray) -> bool:
+        # First, try general YOLO (standard person detection)
+        yolo_person = self._is_present(frame, [0])
+        if yolo_person:
+            return True
+            
+        # Second, fallback to face detection if close-up
+        face_crop = self.face_det.detect(frame)
+        if face_crop is not None:
+            # print("  [DEBUG] YOLO missed body, but FaceDetector found a human face")
+            return True
+            
+        return False
+
+    def _is_present(self, frame: np.ndarray, target_classes: list[int]) -> bool:
+        if self.model is None or frame is None:
+            return True # Fallback
+
+        try:
+            results = self.model.predict(frame, conf=self.conf, verbose=False)
+            for result in results:
+                if not result.boxes:
+                    continue
+                for box in result.boxes:
+                    cls = int(box.cls[0])
+                    if cls in target_classes:
+                        return True
+        except Exception as exc:
+            print(f"[GeneralDetector] Error: {exc}")
+            return True
+
+        return False
+
+
 class FaceDetector:
     def __init__(self):
         xml = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -705,14 +771,25 @@ class FaceDetector:
 
 
 class SAWNDetector:
-    THRESHOLD = 0.50
+    # Raised from 0.88 → 0.90: stricter gate compensated by lower motion threshold.
+    THRESHOLD = 0.90
+    # Raised from 0.93 → 0.96: vehicle class needs high confidence + presence validation.
+    VEHICLE_THRESHOLD = 0.96
+    # Raised from 4 → 5 and radius from 2 → 3: require more sustained temporal agreement.
+    CONSENSUS_MIN_HITS = 5
+    CONSENSUS_RADIUS = 3
+    PLATE_SCAN_MAX_FALLBACK_RETRIES = 2
 
     def __init__(self, movinet_path: str, plate_model_path: str = "models/yolo/plates_yolov8/weights/best.pt", output_dir: str = "outputs/violations"):
         self.classifier = MoViNetClassifier(movinet_path)
         self.plate_det = PlateDetector(plate_model_path)
+        self.obj_det = GeneralObjectDetector("yolov8n.pt")
         self.out_dir = Path(output_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self._counter = self._get_last_id()
+
+    def predict_segment(self, frames: List[np.ndarray]) -> tuple[str, float]:
+        return self.classifier.predict_segment(frames)
 
     def _get_last_id(self) -> int:
         files = list(self.out_dir.glob("violation_*_snapshot.jpg"))
@@ -748,6 +825,125 @@ class SAWNDetector:
             return 99
         return sum(ch1 != ch2 for ch1, ch2 in zip(a, b))
 
+    def _label_threshold(self, label: str) -> float:
+        # Normal class should never trigger — threshold of 1.0 means unreachable.
+        if "Normal" in (label or ""):
+            return 1.0
+        # Vehicle-only motion is a common false-positive source, so require stronger confidence.
+        if "Vehicle" in label:
+            return self.VEHICLE_THRESHOLD
+        return self.THRESHOLD
+
+    def _violation_label(self, label: str) -> str:
+        if "Pedestrian" in (label or ""):
+            return "PedestrianLittering"
+        return "VehicleLittering"
+
+    def _passes_temporal_consensus(self, eval_history: list[tuple[int, int, str, float]], best_idx: int) -> bool:
+        if not eval_history:
+            return False
+
+        best_label = eval_history[best_idx][2]
+        label_threshold = self._label_threshold(best_label)
+        secondary_threshold = max(0.55, label_threshold - 0.12)
+
+        start = max(0, best_idx - self.CONSENSUS_RADIUS)
+        end = min(len(eval_history), best_idx + self.CONSENSUS_RADIUS + 1)
+        neighborhood = eval_history[start:end]
+
+        strong_hits = sum(1 for _, _, label, conf in neighborhood if label == best_label and conf >= secondary_threshold)
+        if strong_hits < self.CONSENSUS_MIN_HITS:
+            print(
+                f"  [SKIP] Consensus failed for {best_label}: hits={strong_hits}/{self.CONSENSUS_MIN_HITS} "
+                f"(threshold={secondary_threshold:.2f})"
+            )
+            return False
+        return True
+
+    def _motion_series(self, frames: List[np.ndarray]) -> list[float]:
+        series: list[float] = []
+        if len(frames) < 2:
+            return series
+
+        prev_gray = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY)
+        prev_gray = cv2.GaussianBlur(prev_gray, (5, 5), 0)
+        for frame in frames[1:]:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (5, 5), 0)
+            diff = cv2.absdiff(gray, prev_gray)
+            series.append(float(np.mean(diff)))
+            prev_gray = gray
+        return series
+
+    def _passes_action_gate(self, frames: List[np.ndarray], label: str) -> bool:
+        # This gate rejects static scenes and smooth pass-by motion that often cause false positives.
+        series = self._motion_series(frames)
+        if not series:
+            return False
+
+        mean_motion = float(np.mean(series))
+        std_motion = float(np.std(series))
+        peak_motion = float(np.max(series))
+        min_motion = float(np.min(series))
+        motion_span = peak_motion - min_motion
+        burst_ratio = peak_motion / max(1e-6, (mean_motion + 1e-6))
+
+        if "Vehicle" in label:
+            # Reverting back to OR logic for vehicles – still requires a burst OR multiple peaks
+            # to separate a throw gesture from a smooth drive-by.
+            gradients = np.diff(np.array(series, dtype=np.float32))
+            sign_changes = int(np.sum(np.diff(np.sign(gradients)) != 0)) if len(gradients) > 1 else 0
+            peak_threshold = mean_motion + (0.8 * std_motion)
+            peak_count = 0
+            for i in range(1, len(series) - 1):
+                if series[i] > series[i - 1] and series[i] >= series[i + 1] and series[i] >= peak_threshold:
+                    peak_count += 1
+
+            sharp_or_complex = (burst_ratio >= 1.8) or (peak_count >= 2) or (sign_changes >= 4)
+            passes = (
+                mean_motion >= 5.0
+                and std_motion >= 2.5
+                and motion_span >= 3.0
+                and burst_ratio >= 1.5
+                and sharp_or_complex
+            )
+        else:
+            # Pedestrian littering - Refined for "purse throws" (lower total motion)
+            # while still blocking head turns (higher timing precision).
+            peak_idx = int(np.argmax(series))
+            # Burst timing: peak should be in the middle of the window, not at edges.
+            center_peak = 1 <= peak_idx <= max(1, len(series) - 2)
+            
+            # Sign changes: a throw has a transient speed-up, peak, then slow-down.
+            gradients = np.diff(np.array(series, dtype=np.float32))
+            sign_changes = int(np.sum(np.diff(np.sign(gradients)) != 0)) if len(gradients) > 1 else 0
+
+            # CALIBRATION:
+            # - False positive head turn: mean=3.3, peak=5.1, often smooth/slow.
+            # - Real violation: purse throw can have mean as low as 3.7.
+            conds = {
+                "mean": mean_motion >= 3.6,
+                "std": std_motion >= 1.0,
+                "span": motion_span >= 2.0,
+                "timing": center_peak,
+                "burst": (sign_changes >= 2 or burst_ratio >= 1.3)
+            }
+            passes = all(conds.values()) or (peak_motion >= 12.0 and std_motion >= 2.5)
+            
+            if not passes:
+                failed = [k for k,v in conds.items() if not v]
+                print(f"  [DEBUG] Action Gate Refused Pedestrian: FAILED={failed} | "
+                      f"mean={mean_motion:.1f} std={std_motion:.1f} span={motion_span:.1f} "
+                      f"peak_idx={peak_idx} burst={burst_ratio:.1f}")
+
+        if not passes:
+            print(
+                "  [SKIP] Action gate rejected "
+                f"{label}: mean={mean_motion:.2f} std={std_motion:.2f} peak={peak_motion:.2f} "
+                f"span={motion_span:.2f} burst={burst_ratio:.2f}"
+            )
+        return passes
+
     def _pick_plate_from_frames(self, frames: List[np.ndarray]) -> tuple[Optional[np.ndarray], str]:
         if not frames:
             print("  [PlateOCR] No frames provided for plate search")
@@ -768,6 +964,10 @@ class SAWNDetector:
         valid_text_count = 0
 
         for frame_no, frame in enumerate(frames):
+            # Fast path: when no plate has been seen yet, skip every other frame on long clips.
+            if len(frames) > 24 and detected_count == 0 and (frame_no % 2 == 1):
+                continue
+
             result = self.plate_det.detect(frame)
             if not result:
                 continue
@@ -839,7 +1039,8 @@ class SAWNDetector:
                 return None, ""
             # Retry OCR on top visual candidates (sorted by sharpness) to recover text.
             print("  [PlateOCR] No votes — retrying OCR on sharpest visual crops...")
-            for rank, (vscore, candidate_crop) in enumerate(sorted(top_visual_crops, key=lambda item: item[0], reverse=True)):
+            retry_candidates = sorted(top_visual_crops, key=lambda item: item[0], reverse=True)[:self.PLATE_SCAN_MAX_FALLBACK_RETRIES]
+            for rank, (vscore, candidate_crop) in enumerate(retry_candidates):
                 fallback_text, fallback_conf = self.plate_det._retry_plate_text(candidate_crop)
                 print(f"    [PlateOCR] Fallback crop #{rank+1} visual_score={vscore:.2f} -> '{fallback_text}'")
                 if self._is_plausible_plate_text(fallback_text):
@@ -940,14 +1141,70 @@ class SAWNDetector:
                 best_idx = max(range(1, len(eval_history)), key=lambda index: eval_history[index][3])
 
         _, peak_frame_idx, best_label, max_conf = eval_history[best_idx]
-        if max_conf < self.THRESHOLD:
-            print(f"  [SKIP] No violation found (Max Conf: {max_conf:.1%})")
+        
+        # --- SMART AGENT MAPPING ---
+        # Get frame at peak for presence check.
+        cap_check = cv2.VideoCapture(video_path)
+        cap_check.set(cv2.CAP_PROP_POS_FRAMES, peak_frame_idx)
+        ret_check, frame_check = cap_check.read()
+        cap_check.release()
+        
+        is_person = self.obj_det.is_person_present(frame_check) if ret_check else False
+        is_vehicle = self.obj_det.is_vehicle_present(frame_check) if ret_check else False
+        
+        final_label = best_label
+        if is_person and not is_vehicle:
+            final_label = "PedestrianLittering"
+        elif is_vehicle and not is_person:
+            final_label = "VehicleLittering"
+        elif not is_person and not is_vehicle:
+            print(f"  [SKIP] No agent (person/vehicle) detected at peak frame {peak_frame_idx}")
             return None
+
+        # Apply thresholds based on the CORRECTED agent label.
+        label_threshold = self._label_threshold(final_label)
+        effective_threshold = min(label_threshold, 0.85) # Lower if presence confirmed
+        
+        if max_conf < effective_threshold:
+            print(f"  [SKIP] Conf {max_conf:.1%} below effective threshold {effective_threshold:.1%} for {final_label}")
+            return None
+
+        if "Vehicle" in final_label:
+            vehicle_support_hits = sum(
+                1 for _, _, label, conf in eval_history
+                if "Vehicle" in label and conf >= 0.82
+            )
+            if vehicle_support_hits < 2:
+                print(f"  [SKIP] Vehicle support too weak: hits={vehicle_support_hits}")
+                return None
+
+        if not self._passes_temporal_consensus(eval_history, best_idx):
+            return None
+
+        best_window_start = max(0, peak_frame_idx - 8)
+        best_window_end = min(total_frames - 1, peak_frame_idx + 8)
+        action_frames = []
+        cap_action = cv2.VideoCapture(video_path)
+        cap_action.set(cv2.CAP_PROP_POS_FRAMES, best_window_start)
+        for _ in range(max(2, best_window_end - best_window_start + 1)):
+            ret_action, frame_action = cap_action.read()
+            if not ret_action:
+                break
+            action_frames.append(frame_action)
+        cap_action.release()
+
+        action_gate_passed = self._passes_action_gate(action_frames, best_label)
+        allow_override = "Pedestrian" in best_label
+        high_conf_override = allow_override and (max_conf >= min(0.94, label_threshold + 0.10))
+        if not action_gate_passed and not high_conf_override:
+            return None
+        if not action_gate_passed and high_conf_override:
+            print(f"  [INFO] Action gate overridden due to very high confidence ({max_conf:.1%})")
 
         print(f"  [DETECTED] {best_label} at frame {peak_frame_idx} ({max_conf:.1%})")
 
         self._counter += 1
-        violation_type = "Pedestrian" if "Pedestrian" in best_label else "Vehicle"
+        violation_type = self._violation_label(best_label)
 
         cap = cv2.VideoCapture(video_path)
         cap.set(cv2.CAP_PROP_POS_FRAMES, peak_frame_idx)
@@ -956,8 +1213,8 @@ class SAWNDetector:
         start_frame = max(0, peak_frame_idx - (fps * 3))
         clip_frames = []
         plate_scan_frames = []
-        # Sample every ~3–4 frames so more clear frames are available for OCR consensus.
-        sample_every = max(1, fps // 8)
+        # Sample every ~5 frames to reduce no-plate latency while retaining consensus coverage.
+        sample_every = max(1, fps // 6)
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
         for i in range(int(fps * 6)):
             try:
@@ -1033,6 +1290,9 @@ class SAWNDetector:
         violations = []
         last_violation_time = 0
         cooldown = 5
+        frame_idx = 0
+        consecutive_label = ""
+        consecutive_hits = 0
 
         try:
             while True:
@@ -1046,9 +1306,44 @@ class SAWNDetector:
 
                 if len(window) == 16:
                     label, conf = self.classifier.predict_segment(window)
-                    if conf > self.THRESHOLD and (time.time() - last_violation_time) > cooldown:
-                        print(f"  [LIVE DETECTED] {label} ({conf:.1%})")
-                        violation_type = "Pedestrian" if "Pedestrian" in label else "Vehicle"
+                    
+                    # --- SMART AGENT MAPPING ---
+                    is_person = self.obj_det.is_person_present(frame)
+                    is_vehicle = self.obj_det.is_vehicle_present(frame)
+                    
+                    final_label = label
+                    if is_person and not is_vehicle:
+                        final_label = "PedestrianLittering"
+                    elif is_vehicle and not is_person:
+                        final_label = "VehicleLittering"
+                    elif not is_person and not is_vehicle:
+                        # No agent? Skip window.
+                        consecutive_hits = 0
+                        continue
+
+                    label_threshold = self._label_threshold(final_label)
+                    effective_threshold = min(label_threshold, 0.85)
+                    
+                    if conf >= effective_threshold:
+                        if final_label == consecutive_label:
+                            consecutive_hits += 1
+                        else:
+                            consecutive_label = final_label
+                            consecutive_hits = 1
+                    else:
+                        consecutive_label = ""
+                        consecutive_hits = 0
+
+                    action_gate_passed = self._passes_action_gate(window, final_label)
+                    high_conf_override = conf >= min(0.97, label_threshold + 0.10)
+
+                    if (
+                        consecutive_hits >= self.CONSENSUS_MIN_HITS
+                        and (time.time() - last_violation_time) > cooldown
+                        and (action_gate_passed or high_conf_override)
+                    ):
+                        print(f"  [LIVE DETECTED] {final_label} ({conf:.1%})")
+                        violation_type = self._violation_label(final_label)
 
                         self._counter += 1
                         snapshot = frame.copy()
@@ -1074,6 +1369,10 @@ class SAWNDetector:
                         if callback:
                             callback(violation)
                         last_violation_time = time.time()
+                        consecutive_label = ""
+                        consecutive_hits = 0
+
+                frame_idx += 1
 
                 if show_preview:
                     cv2.imshow("SAWN Live Dashboard", frame)

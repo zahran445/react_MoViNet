@@ -21,6 +21,9 @@ All scripts use these **exact** folder names — no renaming needed.
 
 ## System Architecture
 
+> [!NOTE]
+> For a detailed component diagram and data flow, see [architecture_overview.md](file:///C:/Users/Asus/.gemini/antigravity/brain/c5631001-7b44-4759-b7b4-b449e79e60d4/architecture_overview.md).
+
 ```
 Camera / Video
       │

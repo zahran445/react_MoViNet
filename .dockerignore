@@ -10,31 +10,39 @@ __pycache__/
 .vscode/
 .idea/
 
-# Local datasets and large artifacts
-New_SawnDataset/
-New_SawnDataset-main/
-New_SawnDataset*/
-outputs/
-models/
-sawn.db
-debug_video.py
-*.mp4
-*.avi
-*.mkv
-*.mov
-*.pt
-*.pth
-*.onnx
-*.tflite
-*.keras
-*.h5
-*.zip
-*.tar
-*.tar.gz
-*.7z
-*.png
-*.jpg
-*.jpeg
+# Documentation and logs
+README.md
+FALSE_POSITIVE_FIX.md
+*.md
+*.txt
+*.ps1
+!requirements.txt
+
+# Development and testing
+debug_*.py
+test_*.py
+test_*.jpg
+*.log
+Thumbs.db
+.DS_Store
+*.gitattributes
+*.git
+.gitignore
+.cursor/
+.vscode/
+.idea/
+ "new_license plate dataset/"
+ New_SawnDataset/
+ New_SawnDataset-main/
+ New_SawnDataset*/
+ venv/
+ __pycache__/
+ *.pyc
+ *.pyo
+ *.pyd
+
+# Keep model weights in the build context
+# models/ and *.pt are now allowed
 
 # OS / editor junk
 *.log
